@@ -31,6 +31,13 @@ LAN without the harness noticing — point `HELENA_SERVER_URL` at it.
 
 ---
 
+> **New here, or just want it running?** Read **[SETUP.md](./SETUP.md)** instead of
+> this file — one linear path, copy-paste blocks, nothing to skip around.
+> Everything below this point is reference material: what each piece does,
+> every command, every setting. Come back to it once HELENA is already running.
+
+---
+
 ## Quick start
 
 Copy-paste, in order, in your regular terminal (not inside HELENA):
@@ -166,6 +173,14 @@ not in your regular terminal. `/help` shows this same list live.
 | `/speak on` \| `off` | auto-speak every reply |
 | `/voice-setup` | show exactly what's needed for both of the above |
 
+**Bare hands** — see [Bare hands](#bare-hands) for setup
+
+| command | does |
+|---|---|
+| `/barehands-setup` | clone, start, and connect the barehands hand-tracked board |
+| `/board <action> [k=v...]` | send a raw board command, e.g. `/board present src=models/car.glb` |
+| `/board-state` | show what's actually on the board right now |
+
 ## Using it
 
 Once you're at the `you ›` prompt, you don't need slash commands for most of
@@ -210,6 +225,9 @@ git diff | helena -p "review this diff" --mode plan
 | `fetch_url` | network | fetch a page and convert it to readable text |
 | `analyze_image` | read | ask a multimodal model about an image or screenshot |
 | `open_app`, `close_app` | execute | launch/quit a native app, or open a URL (macOS) |
+| `board_state` | read | look at what's actually on the barehands board right now |
+| `board_command` | write | stage or spotlight something on the barehands board — see [Bare hands](#bare-hands) |
+| `board_stage_media` | write | copy a file into the board's media airlock, optionally presenting it in one step |
 | `todo_write` | — | the visible task list for multi-step work |
 | `spawn_agent` | — | delegate to a subagent (below) |
 | `get_weather`, `get_stock`, `add_reminder`, `remember`, `get_time` | mixed | the original HELENA assistant features, kept |
@@ -272,6 +290,98 @@ homework assignment.
 
 If you're on `yolo` mode (or ran `/trust`), none of this pauses for
 confirmation either — see [Permissions](#permissions).
+
+## Bare hands
+
+[barehands](https://github.com/jaredrhod/barehands) is a separate, standalone
+project (stdlib-only Python, AGPL-3.0-or-later, © Jared Rhodenizer) that turns
+a webcam into a hand-tracked control surface: cards, images, and 3D models
+float over your hands as glass you pinch, drag, throw, and blow apart into an
+exploded view. HELENA integrates with it as a client over `localhost` only —
+nothing from barehands is bundled into this repo, and nothing here ever
+reaches past `127.0.0.1`.
+
+```bash
+/barehands-setup
+```
+
+does the whole thing: clones barehands (default `~/barehands`, or pass a path),
+starts its server, and saves the connection into `~/.helena/settings.json` so
+every project HELENA runs in from now on can see it. There's no dependency
+install step because barehands has zero dependencies — it's plain Python
+stdlib, and its hand-tracking (MediaPipe) and 3D rendering (three.js) load
+from CDNs the first time you open the page.
+
+**Recommended right after setup:** `extras/barehands/stage.html` in this repo
+is a drop-in replacement that loosens the tap-gesture timing (the stock
+defaults are tighter than webcam tracking jitter can reliably hit — tapping
+felt unreliable because of this, not your lighting) and adds an optional
+Stark-style HUD background (`?bg=stark`) instead of your own mirrored face
+on the projector. Copy it over the one `/barehands-setup` installed:
+
+```bash
+cp extras/barehands/stage.html ~/barehands/stage.html
+```
+
+Full explanation of exactly what it changes and why:
+`extras/barehands/BAREHANDS-VISUAL-PATCH.md`.
+
+Once it's set up:
+
+* **Show it something.** "Show me the car model" / "put the roadmap up" — ask
+  HELENA to show or pull up anything and it reaches for the board with
+  `board_command` (action `"present"` lands something center stage, enlarged
+  and spotlit) or `board_stage_media` if the file isn't in the board's media
+  folder yet.
+* **It has eyes on the board too.** `board_state` reads what's actually up
+  there right now — the user moves things by hand, so HELENA checks rather
+  than assumes before commenting on board contents.
+* **The ring is HELENA's face.** Once configured, the board's on-screen ring
+  automatically mirrors HELENA's live state — idle, listening (while `/voice`
+  is recording), thinking (while a turn is running), speaking (while a reply
+  is being read aloud) — with zero extra setup; the REPL writes it
+  automatically around each turn.
+
+Manual commands, if you want to drive the board directly instead of asking
+HELENA to:
+
+```
+/board present src=models/engine.glb title="V8"
+/board-state
+```
+
+### The Stark-tech setup: camera + projector
+
+The vision this was built for: a camera on your desk watching your hands,
+airplaying the whole thing to a projector so it looks like you're operating
+a heads-up display out of a movie.
+
+1. `/barehands-setup`, then open `http://127.0.0.1:8794/stage.html` in Chrome
+   and allow the camera.
+2. Put that Chrome window on whichever display/Space you're going to project,
+   and full-screen it (`Cmd+Ctrl+F` on macOS).
+3. **Control Center → Screen Mirroring →** your projector's AirPlay device.
+   AirPlay mirrors the whole display, so the board needs to be the only thing
+   on the display you pick.
+4. Keep the camera pointed at your actual hands, not at the projected image
+   itself — otherwise the tracker can confuse the projection for a second
+   hand.
+
+### 3D models and full-stack apps together
+
+The board can display any 3D model you already have or download — drop a
+`.glb`/`.gltf` into the workspace and ask HELENA to stage it
+(`board_stage_media` copies it into the airlock; `media/holo/` renders it as a
+blue hologram wireframe instead of solid). Generating new 3D models from
+scratch isn't wired in yet; today HELENA displays models you already have
+rather than creating new ones from a text description.
+
+Full-stack apps and the board are complementary, not the same feature:
+`create_project` + `run_dev_server` (see [Building a full-stack project,
+actually](#building-a-full-stack-project-actually)) build and run the app;
+once it's running, HELENA can stage a screenshot, a diagram, or a related 3D
+asset on the board so you're looking at the glass instead of the terminal
+while you talk through what it built.
 
 ## Permissions
 
@@ -470,6 +580,38 @@ at startup). The full copy-paste steps are in [Voice](#voice) below.
 **The model narrates doing something it didn't actually do** — see
 [Fixing hallucinated tool use](#fixing-hallucinated-tool-use) above; start
 with `/doctor` to check whether your model genuinely supports tool calling.
+
+**HELENA keeps trying to create or edit a file, "let me try that again" on
+loop, and nothing ever shows up** — this was a real bug with two distinct
+causes, both now fixed at the code level rather than relying on the model to
+notice on its own:
+
+1. *A repeatedly-declined permission prompt.* In `ask` mode, pressing Enter
+   at the `allow?` prompt without typing anything answers **no** (the prompt
+   says "[n] no (default)" — easy to miss if you're moving fast, or expecting
+   Enter to accept the default the way it does in some other tools). Every
+   decline used to just get relayed back to the model as "try something
+   else," which a smaller model doesn't always act on — it would ask again,
+   get declined again, forever. The agent loop now counts consecutive
+   identical declines and, after two, forces a hard stop: HELENA will tell
+   you plainly in its reply that it's blocked waiting on your approval for
+   that specific action, instead of silently retrying. If you actually meant
+   to say yes, type `y` (not blank) at the prompt, or switch to
+   `/mode auto` / `/trust` if you'd rather approve writes in advance.
+2. *A write rejected for being outside the workspace.* File tools are
+   confined to the workspace folder by default (see
+   [Permissions](#permissions)) — a path outside it fails with a clear error,
+   but a model retrying the identical write unchanged would previously just
+   repeat the same silent failure. The same repeated-identical-failure
+   breaker above now catches this too: after the exact same call fails the
+   same way twice, HELENA stops and tells you what it was trying to do and
+   the exact error, instead of looping. If this is what's happening to you,
+   `/workspace unlock` (or `/trust`) if you actually want it writing outside
+   this project folder.
+
+`/doctor` is still the right first stop for anything file-related — it shows
+the workspace root, permission mode, and whether settings are loading from
+where you expect.
 
 ## The server API
 
