@@ -21,6 +21,7 @@ WEB_TOOLS = ["web_search", "fetch_url"]
 WRITE_TOOLS = ["write_file", "create_project", "edit_file", "delete_path"]
 EXEC_TOOLS = ["run_command", "run_dev_server", "check_job"]
 DESKTOP_TOOLS = ["open_app", "close_app"]
+BOARD_TOOLS = ["board_command", "board_state", "board_stage_media"]
 
 
 @dataclass
@@ -147,11 +148,16 @@ sound, say so instead of inventing findings.
             "A full-capability agent for a multi-step task that doesn't fit the other "
             "types. Has every tool except spawning further subagents."
         ),
-        tools=READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS + WEB_TOOLS + DESKTOP_TOOLS + ["todo_write", "analyze_image"],
+        tools=READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS + WEB_TOOLS + DESKTOP_TOOLS + BOARD_TOOLS
+        + ["todo_write", "analyze_image"],
         max_iterations=30,
         system_prompt=BASE_RULES + BUILD_RULES + """
 Work the task end to end with whatever tools it needs. Investigate first, act
-in small verifiable steps, and check your work before reporting.
+in small verifiable steps, and check your work before reporting. If the task
+involves the barehands board (github.com/jaredrhod/barehands) and it's
+configured, use board_command / board_stage_media to actually put results up
+for the user to see and grab by hand — a finished build is more useful shown
+on the glass than only described in your report.
 """,
     ),
 }
