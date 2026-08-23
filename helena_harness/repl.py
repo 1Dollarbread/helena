@@ -6,9 +6,14 @@ import asyncio
 import base64
 import contextlib
 import os
+import shlex
 import signal
 import sys
+import time
 from pathlib import Path
+from typing import Any
+
+import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.document import Document
@@ -16,6 +21,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from . import barehands_client as bh
 from . import profile as profile_store
 from . import tts, voice
 from .agent import Agent
@@ -61,6 +67,9 @@ COMMANDS: dict[str, str] = {
     "/say": "Speak text out loud right now — /say testing one two three",
     "/speak": "on | off — auto-speak every reply (needs /voice-setup done first)",
     "/voice-setup": "Show what's needed to enable voice input and HELENA's spoken voice",
+    "/barehands-setup": "Clone, start, and connect the barehands hand-tracked board",
+    "/board": "Send a raw board command — /board present src=models/car.glb title=\"My Car\"",
+    "/board-state": "Show what's actually on the barehands board right now",
     "/exit": "Quit (Ctrl-D also works)",
 }
 
@@ -132,6 +141,10 @@ class Repl:
 
         self.ui.banner(model_label, str(self.config.workspace), self.config.mode, self.config.server_url)
         await self._check_tool_calling_support(model_label)
+        # If barehands is configured, make sure its ring starts from a known
+        # state rather than whatever was left over from a previous session
+        # that ended uncleanly (crash, kill -9) with the ring stuck mid-"thinking".
+        bh.write_ring_state(self.config, "idle")
 
         USER_DIR.mkdir(parents=True, exist_ok=True)
         self.session = PromptSession(
@@ -199,6 +212,7 @@ class Repl:
                 self.ui.error(f"{type(exc).__name__}: {exc}")
 
     async def shutdown(self) -> None:
+        bh.write_ring_state(self.config, "idle")
         if self._reminder_task:
             self._reminder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -250,9 +264,18 @@ class Repl:
         return None
 
     async def _guarded_turn(self, text: str) -> None:
-        """Run one agent turn, cancellable with Ctrl-C."""
+        """Run one agent turn, cancellable with Ctrl-C.
+
+        If barehands is configured, the board's ring mirrors the shape of
+        this method exactly: "thinking" the moment work starts, "speaking"
+        only around the actual TTS playback, "idle" the instant everything
+        settles — including every early-return path (interrupted, cancelled),
+        via the outer try/finally, so the ring can never get stuck mid-state
+        after a Ctrl-C.
+        """
         images, self._pending_images = self._pending_images, []
         self.busy = True
+        bh.write_ring_state(self.config, "thinking")
         loop = asyncio.get_running_loop()
         task = asyncio.create_task(self.agent.send(text, images=images or None))
         self._current_task = task
@@ -262,40 +285,43 @@ class Repl:
             loop.add_signal_handler(signal.SIGINT, task.cancel)
             installed = True
         try:
-            result = await task
-        except asyncio.CancelledError:
-            self.ui.print()
-            self.ui.warn("Interrupted. The conversation is intact — say what to do differently.")
-            return
-        except KeyboardInterrupt:
-            task.cancel()
-            self.ui.warn("Interrupted.")
-            return
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                self.ui.print()
+                self.ui.warn("Interrupted. The conversation is intact — say what to do differently.")
+                return
+            except KeyboardInterrupt:
+                task.cancel()
+                self.ui.warn("Interrupted.")
+                return
+
+            self.ui.usage({
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_seconds": result.seconds,
+                "tool_calls": result.tool_calls,
+            })
+            self.transcript.save(self.agent.messages, self.agent.totals)
+            self._flush_reminders()
+            if self.config.speak_replies and result.text.strip():
+                # Best-effort — a TTS hiccup (rate limit, network) should never
+                # take down the actual conversation, just skip the audio quietly
+                # with a one-line note instead of raising into the REPL loop.
+                bh.write_ring_state(self.config, "speaking")
+                try:
+                    await tts.speak(result.text, self.config.elevenlabs_api_key, self.config.elevenlabs_voice_id)
+                except tts.TTSError as exc:
+                    self.ui.warn(f"(spoken reply skipped: {exc})")
         finally:
             self.busy = False
             self._current_task = None
+            bh.write_ring_state(self.config, "idle")
             if installed:
                 # remove_signal_handler restores Python's default SIGINT
                 # behaviour, which is what prompt_toolkit expects at the prompt.
                 with contextlib.suppress(NotImplementedError, RuntimeError):
                     loop.remove_signal_handler(signal.SIGINT)
-
-        self.ui.usage({
-            "prompt_tokens": result.prompt_tokens,
-            "completion_tokens": result.completion_tokens,
-            "total_seconds": result.seconds,
-            "tool_calls": result.tool_calls,
-        })
-        self.transcript.save(self.agent.messages, self.agent.totals)
-        self._flush_reminders()
-        if self.config.speak_replies and result.text.strip():
-            # Best-effort — a TTS hiccup (rate limit, network) should never
-            # take down the actual conversation, just skip the audio quietly
-            # with a one-line note instead of raising into the REPL loop.
-            try:
-                await tts.speak(result.text, self.config.elevenlabs_api_key, self.config.elevenlabs_voice_id)
-            except tts.TTSError as exc:
-                self.ui.warn(f"(spoken reply skipped: {exc})")
 
     # --- reminders ---------------------------------------------------------
 
@@ -346,6 +372,9 @@ class Repl:
             "/say": self.cmd_say,
             "/speak": self.cmd_speak,
             "/voice-setup": self.cmd_voice_setup,
+            "/barehands-setup": self.cmd_barehands_setup,
+            "/board": self.cmd_board,
+            "/board-state": self.cmd_board_state,
         }
         handler = handlers.get(cmd)
         if not handler:
@@ -783,6 +812,16 @@ class Repl:
             "configured" if self.config.elevenlabs_api_key else "no ELEVENLABS_API_KEY set — run /voice-setup",
         ])
         rows.append(["python interpreter", sys.executable])
+
+        if bh.is_configured(self.config):
+            alive = await bh.server_alive(self.config)
+            rows.append([
+                "barehands board",
+                f"configured at {self.config.barehands_path} — "
+                + ("server responding" if alive else "server NOT responding, run /barehands-setup"),
+            ])
+        else:
+            rows.append(["barehands board", "not set up — run /barehands-setup"])
         self.ui.table("Doctor", ["check", "status"], rows)
 
     def cmd_stream(self, args: list[str]) -> None:
@@ -803,11 +842,14 @@ class Repl:
             return
 
         self.ui.print("[dim]🎙️  Recording — press Enter when you're done talking.[/dim]")
+        bh.write_ring_state(self.config, "listening")
         try:
             audio = await voice.record_until_enter()
         except Exception as exc:
             self.ui.error(f"Couldn't record audio: {exc}")
             return
+        finally:
+            bh.write_ring_state(self.config, "idle")
 
         self.ui.print("[dim]Transcribing...[/dim]")
         try:
@@ -828,10 +870,13 @@ class Repl:
         if not text:
             self.ui.warn("Usage: /say <text>")
             return
+        bh.write_ring_state(self.config, "speaking")
         try:
             await tts.speak(text, self.config.elevenlabs_api_key, self.config.elevenlabs_voice_id)
         except tts.TTSError as exc:
             self.ui.error(str(exc))
+        finally:
+            bh.write_ring_state(self.config, "idle")
 
     def cmd_speak(self, args: list[str]) -> None:
         if args and args[0] in ("on", "off"):
@@ -886,3 +931,174 @@ class Repl:
   running when you edited {profile_file} (env vars are only read once, at startup —
   /exit and start `helena` fresh after editing your profile).
 """)
+
+    # --- barehands ---------------------------------------------------------
+
+    async def cmd_barehands_setup(self, args: list[str]) -> None:
+        """Clone (if needed), start, and connect the barehands hand-tracked
+        board — github.com/jaredrhod/barehands. barehands itself has zero
+        dependencies (stdlib-only Python), so this is just: get the code,
+        run it, tell HELENA where it lives. No pip install step exists
+        because none is needed.
+        """
+        target = Path(os.path.expanduser(args[0])).resolve() if args else (Path.home() / "barehands")
+
+        if bh.repo_path(self.config) == target and await bh.server_alive(self.config):
+            self.ui.print(
+                f"barehands is already set up at [bold]{target}[/bold] and its server is responding. "
+                "Nothing to do — /board-state to look at it, or /board to put something up."
+            )
+            return
+
+        if (target / "server.py").is_file():
+            self.ui.notice(f"Found an existing barehands checkout at {target} — skipping clone.")
+        else:
+            if target.exists() and any(target.iterdir()):
+                self.ui.warn(f"{target} already exists and isn't empty. Pass a different path: "
+                             f"/barehands-setup ~/somewhere-else")
+                return
+            self.ui.notice(f"Cloning github.com/jaredrhod/barehands into {target}…")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "clone", "https://github.com/jaredrhod/barehands", str(target),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await proc.communicate()
+            except FileNotFoundError:
+                self.ui.error("`git` isn't installed or isn't on PATH — install git and try again.")
+                return
+            if proc.returncode != 0:
+                self.ui.error(f"git clone failed:\n{out.decode('utf-8', 'replace')[-1500:]}")
+                return
+            self.ui.print(f"[green]Cloned to {target}.[/green]")
+
+        # Read the port it'll actually listen on (barehands.json, or the
+        # server's own default) before starting it, so we know what to poll.
+        port = 8794
+        config_path = target / "barehands.json"
+        if config_path.is_file():
+            try:
+                import json
+                port = int(json.loads(config_path.read_text("utf-8")).get("port", 8794))
+            except (OSError, ValueError, TypeError):
+                pass
+
+        already_running = False
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(f"http://127.0.0.1:{port}/config", timeout=2.0)
+                already_running = res.status_code == 200
+        except httpx.HTTPError:
+            already_running = False
+
+        if already_running:
+            self.ui.notice(f"Something is already answering on port {port} that looks like barehands — using it as-is.")
+        else:
+            self.ui.notice(f"Starting the barehands server on port {port}…")
+            from .tools.shell import RunCommandTool
+
+            runner = RunCommandTool()
+            started = await runner._run_background(f'"{sys.executable}" server.py', target, self.ctx)
+            job_id = started.meta.get("job_id")
+            job = self.ctx.jobs.get(job_id) if job_id else None
+            if job is None:
+                self.ui.error(f"Couldn't start it: {started.content}")
+                return
+
+            deadline = time.monotonic() + 8
+            alive = False
+            while time.monotonic() < deadline:
+                if job.proc.returncode is not None:
+                    break
+                try:
+                    async with httpx.AsyncClient() as client:
+                        res = await client.get(f"http://127.0.0.1:{port}/config", timeout=1.0)
+                        if res.status_code == 200:
+                            alive = True
+                            break
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.4)
+
+            if job.proc.returncode is not None:
+                try:
+                    log = job.stdout_path.read_text("utf-8", errors="replace")
+                except OSError:
+                    log = ""
+                self.ui.error(f"The server exited immediately:\n{log[-1000:]}")
+                return
+            if not alive:
+                self.ui.warn(
+                    f"Started it (job {job_id}), but it isn't answering on port {port} yet. "
+                    f"Check on it with /jobs or check_job(job_id=\"{job_id}\"); a busy port "
+                    "usually means another barehands (or something else) already owns it."
+                )
+            else:
+                self.ui.print(f"[green]barehands is up (job {job_id}).[/green]")
+
+        self.config.barehands_path = str(target)
+        self.config.barehands_port = port
+        saved_to = self.config.save_user()
+        self.ui.print(f"[dim]Saved to {saved_to} — every project now knows where barehands lives.[/dim]")
+
+        self.ui.print(f"""
+[bold]Next[/bold]
+  1. Open [bold]http://127.0.0.1:{port}/stage.html[/bold] in Chrome and allow the camera.
+  2. Wave — tap the ring to bloom the orbs, pinch a card to move it.
+  3. HELENA can now use board_command / board_state / board_stage_media, and
+     the ring already mirrors HELENA's state (idle/listening/thinking/speaking)
+     automatically from now on — nothing else to wire up.
+
+[bold]For the Stark-tech projector look[/bold]
+  - Full-screen that Chrome tab on whichever display you're going to mirror
+    (Cmd+Ctrl+F), then Control Center → Screen Mirroring → your projector's
+    AirPlay device. AirPlay mirrors the whole display, so put the board on
+    its own Space/display and mirror that one.
+  - Camera stays pointed at your hands, not at the projected image, or the
+    tracker will confuse the projection for a second hand.
+
+barehands is stdlib-only Python — nothing else to install. It's a separate
+project (github.com/jaredrhod/barehands, AGPL-3.0-or-later, © Jared
+Rhodenizer) that HELENA talks to over http://127.0.0.1:{port} — nothing
+here is bundled into HELENA itself.
+""")
+
+    async def cmd_board(self, args: list[str]) -> None:
+        if not args:
+            self.ui.warn(
+                'Usage: /board <action> [key=value ...], e.g. '
+                '/board present src=models/car.glb title="My Car"'
+            )
+            self.ui.notice(f"Actions: {', '.join(bh.ALLOWED_ACTIONS)}")
+            return
+        action, rest = args[0], args[1:]
+        command: dict[str, Any] = {"a": action}
+        try:
+            tokens = shlex.split(" ".join(rest))
+        except ValueError as exc:
+            self.ui.warn(f"Couldn't parse that (unbalanced quotes?): {exc}")
+            return
+        for token in tokens:
+            if "=" not in token:
+                self.ui.warn(f"Ignoring {token!r} — expected key=value.")
+                continue
+            key, _, value = token.partition("=")
+            command[key] = value
+
+        try:
+            status, body = await bh.post_command(self.config, command)
+        except bh.BarehandsError as exc:
+            self.ui.error(str(exc))
+            return
+        if status == 204:
+            self.ui.print(f"[green]Board took it: {action}[/green]")
+        else:
+            self.ui.error(f"Board rejected it (HTTP {status}). {body[:200]}")
+
+    async def cmd_board_state(self, args: list[str]) -> None:
+        try:
+            state = await bh.get_state(self.config)
+        except bh.BarehandsError as exc:
+            self.ui.error(str(exc))
+            return
+        self.ui.print(bh.describe_state(state))
