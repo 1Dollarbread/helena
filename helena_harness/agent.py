@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+from . import barehands_client as bh
 from .client import ServerError
 from .permissions import Decision, PermissionRequest
 from .tools.base import Tool, ToolContext, ToolError, ToolResult, truncate
@@ -36,9 +37,9 @@ You have real tools. When a request genuinely calls for one, use it — do not d
 - For starting a local dev server (a JS/Python project, a demo, "run this on a port"), use run_dev_server — it detects the right start command and reports the actual URL, instead of you guessing a port. After scaffolding something runnable, actually start it with run_dev_server and give the user the real working URL — don't just describe the commands they'd need to run themselves. For any other long-running background process, use run_command with background: true, then check_job to see its output. spawn_agent is a different thing entirely: delegating a self-contained task to a separate conversation, not a way to keep a process alive — and when work genuinely splits into independent parts (a frontend and a backend, several unrelated modules), issue those spawn_agent calls together in the same turn rather than one after another; independent subagents run concurrently, which matters a lot for something like a full-stack scaffold. Only split work this way when the parts don't depend on each other finishing first.
 - After changing code, verify it: run the tests, the linter, or the program itself.
 - Work in small, checkable steps. For anything with more than about three steps, keep todo_write updated so the user can see where you are.
-- If a tool fails, read the error and adapt. Do not repeat the identical call and hope.
+- If a tool fails, read the error and adapt. Do not repeat the identical call and hope — if the exact same call fails twice in a row, that is a signal to change something (the arguments, the approach, or ask the user), not to try again unchanged.
 - If the user's request is ambiguous in a way that changes what you would build, ask. Otherwise make the sensible call and say what you assumed.
-- Some tools need the user's approval. If one is declined, do not try to route around it — say what you needed and why, and offer an alternative.
+- Some tools need the user's approval. If one is declined, do not try to route around it — say what you needed and why, and offer an alternative. If the same call gets declined twice, stop entirely: say plainly that you're blocked waiting on approval, and let the user decide (approve it explicitly, switch to auto/yolo mode, or a different approach) rather than asking a third time.
 
 ## Never fake a tool call
 
@@ -53,7 +54,7 @@ Be concise by default: a couple of sentences beats a report. Expand when the use
 ## Environment
 
 {environment}
-{memory}{profile}"""
+{memory}{profile}{board}"""
 
 MAX_INLINE_TOOL_SCAN = 4000
 
@@ -69,6 +70,16 @@ _BUILD_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+# The synthetic pseudo-tool name used to bounce a near-miss inline-recovered
+# tool call back to the model as a diagnostic, instead of either running it
+# with wrong arguments or silently discarding it. See _inline_tool_calls.
+_MISMATCH_MARKER = "__unrecognized_tool_call__"
+
+# How many times the identical (tool, key) pair may be denied before the loop
+# stops relaying "try again" back to the model and instead forces it to stop
+# and say so to the user. See _execute_call.
+MAX_IDENTICAL_DENIALS = 2
 
 
 def _looks_like_pasted_files(reply_text: str, triggering_request: str) -> bool:
@@ -107,6 +118,21 @@ class Agent:
     totals: dict[str, float] = field(
         default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0, "turns": 0, "tool_calls": 0}
     )
+    # (tool_name, permission_key) -> consecutive-denial count. Never reset
+    # mid-conversation on purpose: the whole point is to catch a call that
+    # keeps getting asked for and keeps getting declined, across iterations
+    # and across turns, and make the loop stop relaying "do not retry" and
+    # actually force a stop instead of trusting a small local model to
+    # honor that instruction on its own. See _execute_call.
+    _denial_counts: dict[tuple[str, str], int] = field(default_factory=dict, repr=False)
+    # Same idea, but for a tool call that keeps *failing* with the identical
+    # error rather than being declined — the other half of "it keeps saying
+    # let me try that again, in a loop". The most common real case: a write
+    # outside the confined workspace (resolve_path's ToolError) that the
+    # model retries unchanged because the error text alone didn't stop it.
+    # Keyed on (tool, key, error text) so a *different* error on the same
+    # file — genuine progress — doesn't trip the breaker.
+    _error_counts: dict[tuple[str, str, str], int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self._by_name = {t.name: t for t in self.tools}
@@ -129,6 +155,29 @@ class Agent:
         ]
         return "\n".join(lines)
 
+    def board_block(self) -> str:
+        """Barehands usage guidance — only added when it's actually set up,
+        so the prompt stays quiet about a feature that isn't configured."""
+        if not bh.is_configured(self.ctx.config):
+            return ""
+        return (
+            "\n\n## The barehands board\n\n"
+            "A hand-tracked glass board is running on this machine (localhost only) — "
+            "the user's own hands, watched by a camera, moving cards, images, and 3D "
+            "models through the air. You have hands and eyes on it:\n"
+            "- When the user asks to SEE something (\"show me\", \"put it up\", \"pull up "
+            "X\"), don't answer with a wall of text in the terminal — stage it on the "
+            "board with board_command and say what you put up. The board is your "
+            "show-and-tell; reach for it whenever seeing beats reading.\n"
+            "- board_command's a: \"present\" lands something center stage, enlarged and "
+            "spotlit, everything else dimmed — the show-me verb.\n"
+            "- Only files physically inside the barehands media folder can ever be "
+            "staged. If an image or 3D model the user wants shown isn't there yet, call "
+            "board_stage_media first — it copies the file in and can present it in one step.\n"
+            "- Call board_state before commenting on what's on the board — the user "
+            "moves things by hand, so never trust memory over the board's own truth."
+        )
+
     def build_system_prompt(self) -> str:
         if self.system_prompt:
             return self.system_prompt
@@ -143,6 +192,7 @@ class Agent:
             environment=self.environment_block(),
             memory=memory_block,
             profile=profile_block,
+            board=self.board_block(),
             tool_names=", ".join(sorted(self._by_name)) or "(none configured)",
         )
 
@@ -327,10 +377,22 @@ class Agent:
         its own. Without that check, a model narrating something like
         `get_weather {"cmd": "npm start"}` would get "recovered" as a real
         call to get_weather with a `cmd` argument that tool doesn't define
-        and silently ignores, running the wrong thing with no error. Now
-        that candidate is rejected outright and treated as no tool call at
-        all, which is the honest outcome — nothing fires instead of the
-        wrong thing firing.
+        and silently ignores, running the wrong thing with no error. That
+        candidate is rejected outright rather than executed.
+
+        But rejecting it outright used to mean discarding it silently — zero
+        recovered calls, the turn treated as "complete" with the model's own
+        narration as the final answer. For a model that was genuinely trying
+        to call a real tool with slightly wrong argument names, that is a
+        dead end: nothing ran, no error was ever shown to it, and the only
+        way anyone finds out is the user asking again next turn and getting
+        the identical silent non-result — which is exactly the "it keeps
+        saying let me try that again, in a loop" failure this now fixes. So
+        the best schema-mismatched-but-name-recognized candidate is kept and
+        returned as a special marker call (_MISMATCH_MARKER) instead of being
+        dropped; _execute_call turns that into a concrete, actionable
+        diagnostic (the exact argument names it should have used) fed straight
+        back into the same turn, instead of silently going nowhere.
         """
         snippet = text.strip()[:MAX_INLINE_TOOL_SCAN]
         if "{" not in snippet:
@@ -343,6 +405,7 @@ class Agent:
         for match in re.finditer(r'\{[^{}]*"(?:name|tool)"\s*:\s*"[\w_]+".*?\}', snippet, re.DOTALL):
             candidates.append(match.group(0))
 
+        best_mismatch: dict[str, Any] | None = None
         for raw in candidates:
             try:
                 obj = json.loads(raw)
@@ -363,9 +426,27 @@ class Agent:
                     args = {}
             if not isinstance(args, dict):
                 continue
-            if not self._args_match_schema(self._by_name[name], args):
-                continue
-            return [{"id": "inline_0", "type": "function", "function": {"name": name, "arguments": args}}]
+            if self._args_match_schema(self._by_name[name], args):
+                return [{"id": "inline_0", "type": "function", "function": {"name": name, "arguments": args}}]
+            if best_mismatch is None:
+                best_mismatch = {"name": name, "args": args}
+
+        if best_mismatch is not None:
+            tool = self._by_name[best_mismatch["name"]]
+            schema = tool.parameters or {}
+            return [{
+                "id": "inline_mismatch_0",
+                "type": "function",
+                "function": {
+                    "name": _MISMATCH_MARKER,
+                    "arguments": {
+                        "attempted_tool": best_mismatch["name"],
+                        "provided_keys": sorted(best_mismatch["args"]),
+                        "required": schema.get("required") or [],
+                        "allowed": sorted((schema.get("properties") or {}).keys()),
+                    },
+                },
+            }]
         return []
 
     @staticmethod
@@ -440,6 +521,29 @@ class Agent:
         fn = call.get("function") or {}
         name = fn.get("name", "")
         args = fn.get("arguments") or {}
+
+        if name == _MISMATCH_MARKER:
+            # Not a real tool call — see _inline_tool_calls. Nothing runs;
+            # this is a diagnostic bounced straight back so a model that was
+            # genuinely trying to call something real can correct itself
+            # within the same turn instead of the attempt silently vanishing.
+            attempted = args.get("attempted_tool", "?")
+            provided = args.get("provided_keys") or []
+            required = args.get("required") or []
+            allowed = args.get("allowed") or []
+            self.ctx.ui.warn(
+                f"(saw a near-miss call to {attempted} with the wrong argument names — "
+                "bounced it back so the model can retry with the correct ones)"
+            )
+            return self._tool_message(
+                call, attempted,
+                f"Error: that looked like an attempt to call `{attempted}`, but the arguments "
+                f"don't match its real parameters. You passed: {provided or '(none)'}. "
+                f"Required: {required or '(none)'}. Allowed arguments: {allowed or '(none)'}. "
+                f"Call {attempted} again using exactly those argument names — as a real tool "
+                "call, not text.",
+            )
+
         tool = self._by_name.get(name)
 
         if tool is None:
@@ -460,10 +564,11 @@ class Agent:
             detail = tool.detail(args, self.ctx)
         except Exception:
             detail = ""
+        key = tool.permission_key(args) or ""
         request = PermissionRequest(
             tool=name,
             action=tool.action,
-            key=tool.permission_key(args) or "",
+            key=key,
             preview=preview,
             detail=detail,
             agent=self.ctx.agent_name,
@@ -471,11 +576,35 @@ class Agent:
         verdict = await self.ctx.permissions.check(request)
         if verdict.decision is Decision.DENY:
             self.ctx.ui.tool_result(name, False, f"declined — {verdict.reason}")
+            denial_key = (name, key)
+            count = self._denial_counts[denial_key] = self._denial_counts.get(denial_key, 0) + 1
+            if count >= MAX_IDENTICAL_DENIALS:
+                # The exact same call has now been declined more than once.
+                # A cooperative model would already have stopped on its own
+                # per the system prompt's instruction not to retry — but a
+                # smaller local model often doesn't reliably follow that, and
+                # the result is the "keeps saying let me try that again, in a
+                # loop" failure. This forces the stop at the code level
+                # instead of relying on the model's judgment for it.
+                return self._tool_message(
+                    call, name,
+                    f"Not run (declined {count} times now — this exact call, same reason): "
+                    f"{verdict.reason} Stop retrying this call entirely. Tell the user, plainly "
+                    "and in your reply text, that you're blocked waiting on their approval for "
+                    "this specific action, and let them choose: approve it explicitly, switch to "
+                    "/mode auto or /trust if they want writes pre-approved, or suggest a "
+                    "different approach. Do not attempt this exact call again unless the user "
+                    "explicitly tells you to.",
+                )
             return self._tool_message(
                 call, name,
-                f"Not run: {verdict.reason} Do not retry this call; tell the user what you "
-                "needed it for, or take a different approach.",
+                f"Not run: {verdict.reason} Do not retry this call unchanged; tell the user what "
+                "you needed it for, or take a different approach.",
             )
+        # A successful (non-deny) outcome clears any prior denial streak for
+        # this exact call, so an earlier decline doesn't linger and trip the
+        # breaker on an unrelated later attempt with the same key.
+        self._denial_counts.pop((name, key), None)
 
         # Execution.
         self.ctx.tool_calls_made += 1
@@ -483,16 +612,42 @@ class Agent:
             result = await tool.run(args, self.ctx)
         except ToolError as exc:
             self.ctx.ui.tool_result(name, False, str(exc))
-            return self._tool_message(call, name, f"Error: {exc}")
+            return self._error_message(call, name, key, str(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # a tool bug shouldn't kill the session
-            self.ctx.ui.tool_result(name, False, f"{type(exc).__name__}: {exc}")
-            return self._tool_message(call, name, f"Error: {type(exc).__name__}: {exc}")
+            message = f"{type(exc).__name__}: {exc}"
+            self.ctx.ui.tool_result(name, False, message)
+            return self._error_message(call, name, key, message)
 
+        # A clean run clears any error streak for this exact call, same
+        # reasoning as clearing the denial streak above.
+        for error_key in [k for k in self._error_counts if k[0] == name and k[1] == key]:
+            self._error_counts.pop(error_key, None)
         self._render_result(tool, result)
         content = truncate(result.content, self.ctx.config.max_tool_output_chars, "tool output")
         return self._tool_message(call, name, content)
+
+    def _error_message(self, call: dict[str, Any], name: str, key: str, error_text: str) -> dict[str, Any]:
+        """Build the tool-error message, escalating if this exact (tool, key,
+        error) combination has now failed repeatedly in a row — see
+        _error_counts. A model that keeps retrying an identical failing call
+        unchanged (most commonly: a write rejected for being outside the
+        confined workspace) needs a harder stop than one more copy of the
+        same error text, which it has already shown it doesn't act on."""
+        error_key = (name, key, error_text)
+        count = self._error_counts[error_key] = self._error_counts.get(error_key, 0) + 1
+        if count >= MAX_IDENTICAL_DENIALS:
+            return self._tool_message(
+                call, name,
+                f"Error (this exact call has now failed the same way {count} times in a row): "
+                f"{error_text}\nStop retrying this unchanged. Tell the user plainly, in your "
+                "reply text, what you were trying to do and the exact error, and ask how they "
+                "want to proceed — do not attempt this exact call again unless they tell you "
+                "something that would actually change the outcome (a different path, "
+                "/workspace unlock, etc.).",
+            )
+        return self._tool_message(call, name, f"Error: {error_text}")
 
     def _render_result(self, tool: Tool, result: ToolResult) -> None:
         summary = result.display or ("done" if result.ok else "failed")
