@@ -74,6 +74,17 @@ class Config:
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # "Rachel", a stock ElevenLabs voice
 
+    # Bare hands — optional, off by default. Wires in barehands
+    # (github.com/jaredrhod/barehands), a hand-tracked glass control board:
+    # HELENA gets hands and eyes on it (board_command / board_state /
+    # board_stage_media), and the board's on-screen ring mirrors HELENA's own
+    # live state (idle/listening/thinking/speaking) automatically, the same
+    # mechanism barehands.md documents for wiring in an assistant. Empty
+    # barehands_path means "not set up" — /barehands-setup clones, configures,
+    # and starts it in one step. Everything here talks to 127.0.0.1 only.
+    barehands_path: str = ""
+    barehands_port: int = 8794
+
     # Populated at load time; not written back to disk.
     workspace: Path = field(default_factory=Path.cwd)
 
@@ -94,6 +105,10 @@ class Config:
     @property
     def transcript_dir(self) -> Path:
         return self.project_dir / "sessions"
+
+    @property
+    def barehands_url(self) -> str:
+        return f"http://127.0.0.1:{self.barehands_port}"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -140,6 +155,7 @@ class Config:
             "HELENA_VISION_MODEL": "vision_model",
             "HELENA_MODE": "mode",
             "HELENA_ELEVENLABS_VOICE_ID": "elevenlabs_voice_id",
+            "HELENA_BAREHANDS_PATH": "barehands_path",
         }
         for env_key, attr in env_map.items():
             val = os.environ.get(env_key)
@@ -154,7 +170,11 @@ class Config:
             or os.environ.get("ELEVENLABS_API_KEY")
             or self.elevenlabs_api_key
         )
-        for env_key, attr in (("HELENA_NUM_CTX", "num_ctx"), ("HELENA_MAX_ITERATIONS", "max_iterations")):
+        for env_key, attr in (
+            ("HELENA_NUM_CTX", "num_ctx"),
+            ("HELENA_MAX_ITERATIONS", "max_iterations"),
+            ("HELENA_BAREHANDS_PORT", "barehands_port"),
+        ):
             val = os.environ.get(env_key)
             if val and val.isdigit():
                 setattr(self, attr, int(val))
