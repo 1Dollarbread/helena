@@ -37,11 +37,17 @@ class Config:
     # Models
     model: str = ""            # empty means "whatever the server's default is"
     vision_model: str = ""
+    embed_model: str = ""      # empty means the server's own default (nomic-embed-text)
     subagent_model: str = ""   # empty means "same as `model`" — set this to something
                                 # smaller/faster to cut RAM and latency on subagent work,
                                 # which is often read-heavy and doesn't need the biggest model
     num_ctx: int = 8192
     temperature: float = 0.4   # lower than chat default: agents should be literal
+
+    # Cross-project memory — a growing set of embedded notes about the user,
+    # searched by similarity and recalled before every turn. See memory.py.
+    memory_enabled: bool = True
+    memory_top_k: int = 5      # how many recalled memories get injected per turn
 
     # Loop
     max_iterations: int = 30
@@ -153,6 +159,7 @@ class Config:
             "HELENA_MODEL": "model",
             "HELENA_SUBAGENT_MODEL": "subagent_model",
             "HELENA_VISION_MODEL": "vision_model",
+            "HELENA_EMBED_MODEL": "embed_model",
             "HELENA_MODE": "mode",
             "HELENA_ELEVENLABS_VOICE_ID": "elevenlabs_voice_id",
             "HELENA_BAREHANDS_PATH": "barehands_path",
@@ -174,6 +181,7 @@ class Config:
             ("HELENA_NUM_CTX", "num_ctx"),
             ("HELENA_MAX_ITERATIONS", "max_iterations"),
             ("HELENA_BAREHANDS_PORT", "barehands_port"),
+            ("HELENA_MEMORY_TOP_K", "memory_top_k"),
         ):
             val = os.environ.get(env_key)
             if val and val.isdigit():
@@ -181,6 +189,7 @@ class Config:
         for env_key, attr in (
             ("HELENA_ALLOW_OUTSIDE_WORKSPACE", "allow_outside_workspace"),
             ("HELENA_SPEAK_REPLIES", "speak_replies"),
+            ("HELENA_MEMORY_ENABLED", "memory_enabled"),
         ):
             val = os.environ.get(env_key)
             if val is not None:

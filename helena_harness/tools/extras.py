@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from .. import memory as memory_store
 from .. import profile as profile_store
 from ..permissions import Action
 from .base import Tool, ToolContext, ToolError, ToolResult
@@ -296,9 +297,13 @@ class RemindTool(Tool):
 class RememberTool(Tool):
     name = "remember"
     description = """
-    Save a durable fact about the user (preferences, stack, working style, who
-    they are). It is loaded into your context in every future session. Use it
-    when the user says to remember something, or tells you something clearly
+    Save a durable fact, preference, or pattern about the user (their stack,
+    working style, standing preferences, ongoing projects, recurring
+    frustrations, who they are). It's kept in every future session in this
+    project, and also embedded into a cross-project memory store that gets
+    searched and recalled before you answer in *any* project — this is what
+    lets you know the user beyond just the current folder. Use it when the
+    user says to remember something, or tells you something clearly
     long-lived. Don't use it for one-off task details.
     """
     action = Action.WRITE
@@ -320,6 +325,8 @@ class RememberTool(Tool):
         if not fact:
             raise ToolError("`fact` is required.")
         profile_store.add_fact(fact)
+        if ctx.config.memory_enabled:
+            await memory_store.remember(ctx.client, ctx.config.embed_model, ctx.workspace.name, fact)
         return ToolResult(ok=True, content=f"Saved: {fact}", display="noted")
 
 

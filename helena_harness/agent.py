@@ -54,7 +54,7 @@ Be concise by default: a couple of sentences beats a report. Expand when the use
 ## Environment
 
 {environment}
-{memory}{profile}{board}"""
+{memory}{profile}{recall}{board}"""
 
 MAX_INLINE_TOOL_SCAN = 4000
 
@@ -133,6 +133,11 @@ class Agent:
     # Keyed on (tool, key, error text) so a *different* error on the same
     # file — genuine progress — doesn't trip the breaker.
     _error_counts: dict[tuple[str, str, str], int] = field(default_factory=dict, repr=False)
+    # Cross-project memory recalled for the *current* turn, computed once in
+    # `send()` (not per iteration — the tool loop can call `_complete` several
+    # times before a turn is done, and the user's question doesn't change
+    # mid-turn). See `recall_memory`.
+    _memory_block: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         self._by_name = {t.name: t for t in self.tools}
@@ -187,14 +192,41 @@ class Agent:
         memory_block = f"\n\n## Project instructions (from HELENA.md)\n\n{memory}" if memory else ""
         summary = profile_store.context_summary()
         profile_block = f"\n\n## About the user\n\n{summary}" if summary else ""
+        recall_block = (
+            f"\n\n## Recalled from other sessions\n\n{self._memory_block}" if self._memory_block else ""
+        )
         return SYSTEM_PROMPT.format(
             name=self.ctx.config.name,
             environment=self.environment_block(),
             memory=memory_block,
             profile=profile_block,
+            recall=recall_block,
             board=self.board_block(),
             tool_names=", ".join(sorted(self._by_name)) or "(none configured)",
         )
+
+    async def recall_memory(self, query: str) -> str:
+        """Search cross-project memory for whatever's relevant to this turn.
+
+        Best-effort and silent on failure: a server that's down or an
+        embedding model that isn't pulled shouldn't block a turn, and a
+        subagent gets its own fixed system_prompt (see build_system_prompt)
+        so there's nothing to inject for it.
+        """
+        if self.nested or not self.ctx.config.memory_enabled or not query.strip():
+            return ""
+        from . import memory as memory_store
+
+        if not memory_store.count():
+            return ""
+        try:
+            vectors = await self.ctx.client.embed([query], model=self.ctx.config.embed_model or None)
+        except ServerError:
+            return ""
+        if not vectors:
+            return ""
+        hits = memory_store.search(vectors[0], top_k=self.ctx.config.memory_top_k)
+        return "\n".join(f"- {hit['text']}" for hit in hits)
 
     def tool_specs(self) -> list[dict[str, Any]]:
         return [t.spec() for t in self.tools]
@@ -245,6 +277,7 @@ class Agent:
         if images:
             message["images"] = images
         self.messages.append(message)
+        self._memory_block = await self.recall_memory(user_text)
         return await self._run_loop()
 
     async def _run_loop(self) -> TurnResult:

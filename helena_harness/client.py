@@ -138,6 +138,14 @@ class ServerClient:
             model=data.get("model", ""),
         )
 
+    async def embed(self, inputs: list[str], *, model: str | None = None) -> list[list[float]]:
+        payload: dict[str, Any] = {"input": inputs}
+        if model:
+            payload["model"] = model
+        res = await self._client.post("/v1/embeddings", json=payload, timeout=60.0)
+        self._raise_for_status(res)
+        return res.json().get("embeddings") or []
+
     # --- helpers -----------------------------------------------------------
 
     def _payload(
