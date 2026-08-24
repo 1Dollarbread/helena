@@ -22,6 +22,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from . import barehands_client as bh
+from . import memory as memory_store
 from . import profile as profile_store
 from . import tts, voice
 from .agent import Agent
@@ -58,6 +59,8 @@ COMMANDS: dict[str, str] = {
     "/jobs": "Show background commands started by run_command",
     "/memory": "Show HELENA.md, or append a line to it — /memory always use pnpm",
     "/remember": "Save a durable fact about you — /remember I prefer FastAPI",
+    "/recall": "Search cross-project memory — /recall testing habits (no query: list recent)",
+    "/forget": "Delete a saved memory by id — /forget a1b2c3d4e5f6 (ids from /recall)",
     "/reminders": "List pending reminders",
     "/init": "Have HELENA write a HELENA.md for this project",
     "/cd": "Change the workspace directory",
@@ -363,6 +366,8 @@ class Repl:
             "/jobs": self.cmd_jobs,
             "/memory": self.cmd_memory,
             "/remember": self.cmd_remember,
+            "/recall": self.cmd_recall,
+            "/forget": self.cmd_forget,
             "/reminders": self.cmd_reminders,
             "/init": self.cmd_init,
             "/cd": self.cmd_cd,
@@ -723,7 +728,7 @@ class Repl:
             fh.write(f"- {line}\n")
         self.ui.print(f"Added to {path.name}: {line}")
 
-    def cmd_remember(self, args: list[str]) -> None:
+    async def cmd_remember(self, args: list[str]) -> None:
         if not args:
             facts = profile_store.load_profile()["facts"]
             if not facts:
@@ -734,7 +739,50 @@ class Repl:
             return
         fact = " ".join(args)
         profile_store.add_fact(fact)
+        if self.config.memory_enabled:
+            await memory_store.remember(self.client, self.config.embed_model, self.config.workspace.name, fact)
         self.ui.print(f"Noted: {fact}")
+
+    async def cmd_recall(self, args: list[str]) -> None:
+        if not args:
+            rows = memory_store.all_memories(limit=20)
+            if not rows:
+                self.ui.notice(
+                    "No memories saved yet. /remember <fact> saves one, "
+                    "and HELENA notices durable things too as you talk."
+                )
+                return
+            self.ui.table(
+                "Recent memories", ["id", "when", "project", "text"],
+                [[r["id"], r["created_at"][:10], r["project"] or "-", r["text"]] for r in rows],
+            )
+            return
+        query = " ".join(args)
+        try:
+            vectors = await self.client.embed([query], model=self.config.embed_model or None)
+        except ServerError as exc:
+            self.ui.warn(f"Could not search memory: {exc}")
+            return
+        if not vectors:
+            self.ui.warn("The embedding model returned nothing.")
+            return
+        hits = memory_store.search(vectors[0], top_k=self.config.memory_top_k)
+        if not hits:
+            self.ui.notice("No matching memories.")
+            return
+        self.ui.table(
+            "Memory search", ["score", "id", "project", "text"],
+            [[f"{h['score']:.2f}", h["id"], h["project"] or "-", h["text"]] for h in hits],
+        )
+
+    def cmd_forget(self, args: list[str]) -> None:
+        if not args:
+            self.ui.warn("Usage: /forget <id> — see ids with /recall")
+            return
+        if memory_store.forget(args[0]):
+            self.ui.print(f"Forgot memory {args[0]}.")
+        else:
+            self.ui.warn(f"No memory with id {args[0]!r}.")
 
     def cmd_reminders(self, args: list[str]) -> None:
         pending = profile_store.pending_reminders()

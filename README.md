@@ -150,7 +150,9 @@ not in your regular terminal. `/help` shows this same list live.
 | command | does |
 |---|---|
 | `/memory` | show what's in `HELENA.md` |
-| `/remember <fact>` | save a durable fact about you |
+| `/remember <fact>` | save a durable fact about you — kept here, and embedded into cross-project memory |
+| `/recall [query]` | search cross-project memory, or list recent memories with no query |
+| `/forget <id>` | delete a saved memory (ids come from `/recall`) |
 | `/reminders` | show reminders you've asked HELENA to set |
 | `/init` | explore the project and write a starting `HELENA.md` |
 
@@ -767,6 +769,18 @@ for the server's variables, and `helena --help` for flags.
 put project conventions there. `/init` writes one by exploring the project.
 (`CLAUDE.md` or `AGENTS.md` are used as fallbacks if you already keep one.)
 
+**Cross-project memory.** `/remember` (and HELENA noticing something durable
+on its own) doesn't just go in this project's short fact list — it's embedded
+via the server's `/v1/embeddings` and saved to `~/.helena/memory.db`, a small
+sqlite store of notes about you that follows you between projects. Before
+every turn, HELENA embeds what you just said, searches that store by cosine
+similarity, and recalls whatever's actually relevant — not a dump of
+everything it's ever been told. `/recall <query>` runs that same search by
+hand; `/recall` with nothing lists recent memories and their ids; `/forget
+<id>` deletes one. Set `memory_enabled: false` to turn the whole thing off, or
+`memory_top_k` to change how many memories get recalled per turn; `embed_model`
+picks the embedding model (defaults to the server's own, `nomic-embed-text`).
+
 ## Choosing a model
 
 Two levers dominate on local hardware:
@@ -786,7 +800,7 @@ Two levers dominate on local hardware:
 ## Development
 
 ```bash
-pytest                    # 174 tests (+1 that skips without the optional voice extra), no Ollama required
+pytest                    # 190 tests (+1 that skips without the optional voice extra), no Ollama required
 python -m pyflakes helena_server helena_harness
 ```
 
@@ -797,8 +811,8 @@ execution, results fed to the next turn.
 
 ```
 helena_server/     app.py routes · ollama.py client · store.py sqlite · schemas.py
-helena_harness/    agent.py loop · repl.py terminal · permissions.py · tools/
-tests/             server, permissions, file tools, shell/web, agent loop, config
+helena_harness/    agent.py loop · repl.py terminal · permissions.py · memory.py sqlite · tools/
+tests/             server, permissions, file tools, shell/web, agent loop, config, memory
 ```
 
 ## What happened to the JavaScript version
