@@ -1,0 +1,901 @@
+diff --git a/extras/wakeup/README.md b/extras/wakeup/README.md
+new file mode 100644
+index 0000000..c8d65b3
+--- /dev/null
++++ b/extras/wakeup/README.md
+@@ -0,0 +1,109 @@
++# Wake-on-clap
++
++Two claps wakes HELENA and speaks a debrief of the project: git state, recent
++commits, TODOs, and a suggestion for what to work on next.
++
++## 1. Install the voice extra
++
++Clap detection reuses the same `sounddevice` + `numpy` dependency `/voice`
++already needs.
++
++```
++cd path/to/RogerCraig
++source .venv/bin/activate
++pip install -e ".[voice]"
++```
++
++## 2. Test the listener by hand first
++
++Before wiring it to login, confirm it actually hears your claps.
++
++```
++python extras/wakeup/clap_listener.py --workspace "$(pwd)"
++```
++
++Clap twice, about half a second apart. You should see:
++
++```
++[wake] clap 1…
++[wake] clap 2 — waking HELENA
++[debrief] asking HELENA…
++```
++
++Then, a few seconds later, it should speak the debrief out loud (macOS's
++built-in `say` by default — no setup needed for this part).
++
++If it doesn't trigger: check your Mac's mic input level (System Settings →
++Sound → Input) — the claps need to visibly move that meter. If it triggers
++on everything (typing, talking), open `extras/wakeup/clap_listener.py` and
++raise `THRESHOLD` (currently `0.35`) in small steps, testing after each one.
++
++Ctrl-C to stop.
++
++## 3. (Optional) Use your real HELENA voice instead of macOS's `say`
++
++If you've already set up `/say` (see the main README's Voice section —
++`ELEVENLABS_API_KEY` in your shell profile), the debrief automatically uses
++that voice instead. Nothing extra to configure — `debrief.py` checks for
++`ELEVENLABS_API_KEY` at runtime and falls back to `say` if it's missing or
++the request fails.
++
++## 4. Wire it to login
++
++```
++cp extras/wakeup/com.helena.wake.plist ~/Library/LaunchAgents/com.helena.wake.plist
++```
++
++Edit the copy — replace `REPLACE_WITH_ABSOLUTE_PATH` with the real path to
++this repo, e.g. `/Users/you/RogerCraig`:
++
++```
++sed -i '' "s|REPLACE_WITH_ABSOLUTE_PATH|$(pwd)|" ~/Library/LaunchAgents/com.helena.wake.plist
++```
++
++If your clone lives somewhere other than `~/RogerCraig`, also edit
++`HELENA_REPO` at the top of `extras/wakeup/startup.sh` to match — that's the
++path the Terminal window itself will `cd` into.
++
++Load it:
++
++```
++launchctl load ~/Library/LaunchAgents/com.helena.wake.plist
++```
++
++## 5. Test the login path without actually logging out
++
++```
++launchctl start com.helena.wake
++```
++
++A new Terminal window should open on its own, `cd` into the repo, activate
++the venv, and start listening — exactly what should happen next time you
++log in. Clap twice to confirm end-to-end.
++
++## Troubleshooting
++
++**Nothing happens when you `launchctl start` it** — check the log:
++
++```
++cat /tmp/helena-wake.log
++```
++
++**Terminal opens but immediately closes / errors** — almost always the path
++in the plist or `HELENA_REPO` in `startup.sh` doesn't match where you
++actually cloned the repo. Re-run step 4's `sed` command with the correct
++path, or edit both files by hand.
++
++**It hears claps but the debrief comes back empty or errors** — HELENA's own
++server isn't running. `debrief.py` shells out to `helena -p ...`, which
++auto-starts the server the same way the terminal harness does, but Ollama
++itself still needs to be installed and have `qwen2.5:7b-instruct` (or
++whichever model you use) pulled — same requirement as the main README's
++Quick start.
++
++## Uninstall
++
++```
++launchctl unload ~/Library/LaunchAgents/com.helena.wake.plist
++rm ~/Library/LaunchAgents/com.helena.wake.plist
++```
+diff --git a/extras/wakeup/clap_listener.py b/extras/wakeup/clap_listener.py
+new file mode 100644
+index 0000000..e0c61bb
+--- /dev/null
++++ b/extras/wakeup/clap_listener.py
+@@ -0,0 +1,107 @@
++"""Two-clap wake detector for HELENA.
++
++Fully offline, no wake word, no speech recognition — just amplitude-spike
++detection on the raw mic stream, same as a clapper light switch. Requires the
++project's `voice` extra (sounddevice + numpy), which most HELENA setups
++already have for `/voice`:
++
++    pip install -e ".[voice]"
++
++Tuning knobs are the constants below. Clap detection is inherently a blunt
++instrument — a dropped book or a door slam can trigger it. Two claps in a
++tight window cuts false positives a lot; if it's still too sensitive, raise
++THRESHOLD first, then tighten the window.
++
++Usage:
++    python clap_listener.py                      # listen forever
++    python clap_listener.py --workspace ~/code/x  # debrief for a specific project
++"""
++
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import sounddevice as sd
++
++SAMPLE_RATE = 16_000
++BLOCK_MS = 30
++BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
++
++# --- tuning --------------------------------------------------------------
++THRESHOLD = 0.35          # RMS level (0-1 float audio) that counts as "loud"
++REFRACTORY_S = 0.15       # ignore new spikes for this long after one fires (avoids double-counting one clap)
++CLAP_WINDOW_S = 1.2       # both claps must land inside this window
++COOLDOWN_S = 4.0          # after a successful wake, ignore audio for this long
++# ---------------------------------------------------------------------------
++
++HERE = Path(__file__).parent
++
++
++def rms(block: np.ndarray) -> float:
++    return float(np.sqrt(np.mean(np.square(block))))
++
++
++def listen_for_double_clap(workspace: Path) -> None:
++    print(f"[wake] listening for two claps · threshold={THRESHOLD} window={CLAP_WINDOW_S}s")
++    last_spike = 0.0
++    first_clap_at: float | None = None
++    cooldown_until = 0.0
++
++    def callback(indata, frames, time_info, status):  # noqa: ANN001 - sounddevice signature
++        nonlocal last_spike, first_clap_at, cooldown_until
++        now = time.monotonic()
++        if now < cooldown_until:
++            return
++        level = rms(indata[:, 0])
++        if level < THRESHOLD:
++            return
++        if now - last_spike < REFRACTORY_S:
++            return
++        last_spike = now
++
++        if first_clap_at is None:
++            first_clap_at = now
++            print("[wake] clap 1…")
++            return
++
++        if now - first_clap_at <= CLAP_WINDOW_S:
++            print("[wake] clap 2 — waking HELENA")
++            first_clap_at = None
++            cooldown_until = now + COOLDOWN_S
++            trigger(workspace)
++        else:
++            # too slow — this spike becomes a fresh "clap 1" instead of being dropped
++            first_clap_at = now
++            print("[wake] clap 1…")
++
++    with sd.InputStream(
++        samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE, channels=1, dtype="float32", callback=callback
++    ):
++        while True:
++            time.sleep(0.5)
++
++
++def trigger(workspace: Path) -> None:
++    """Runs the debrief in its own process so a crash there can't kill the listener."""
++    subprocess.Popen(
++        [sys.executable, str(HERE / "debrief.py"), "--workspace", str(workspace)],
++    )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Listen for two claps, then run HELENA's debrief.")
++    parser.add_argument("--workspace", default=str(Path.cwd()), help="Project directory to debrief on wake.")
++    args = parser.parse_args()
++    try:
++        listen_for_double_clap(Path(args.workspace).expanduser())
++    except KeyboardInterrupt:
++        print("\n[wake] stopped.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/extras/wakeup/com.helena.wake.plist b/extras/wakeup/com.helena.wake.plist
+new file mode 100644
+index 0000000..69e642c
+--- /dev/null
++++ b/extras/wakeup/com.helena.wake.plist
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>Label</key>
++    <string>com.helena.wake</string>
++
++    <key>ProgramArguments</key>
++    <array>
++        <string>/bin/bash</string>
++        <string>REPLACE_WITH_ABSOLUTE_PATH/extras/wakeup/startup.sh</string>
++    </array>
++
++    <key>RunAtLoad</key>
++    <true/>
++
++    <key>StandardOutPath</key>
++    <string>/tmp/helena-wake.log</string>
++    <key>StandardErrorPath</key>
++    <string>/tmp/helena-wake.log</string>
++</dict>
++</plist>
+diff --git a/extras/wakeup/debrief.py b/extras/wakeup/debrief.py
+new file mode 100644
+index 0000000..1d1221d
+--- /dev/null
++++ b/extras/wakeup/debrief.py
+@@ -0,0 +1,113 @@
++"""Runs after two claps: gathers what changed, asks HELENA to summarize it,
++and speaks the answer out loud.
++
++Deliberately does NOT let the model reach for tools here (`--mode plan`) —
++this fires unattended off a clap, so nothing should be able to write, run a
++command, or need a permission prompt nobody's there to answer. All the real
++context (git status, recent commits, HELENA.md, TODOs) is gathered up front
++in plain subprocess calls and handed to the model as text; the model's only
++job is to summarize it into something worth saying out loud.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++DEBRIEF_PROMPT = """You just woke up. Give a spoken debrief: 4-6 sentences, \
++plain prose (no markdown, no bullet points, no headers — this gets read \
++aloud by a TTS engine). Cover, in this order: (1) what branch/state the repo \
++is in and whether anything's uncommitted, (2) the most recent real progress \
++from the commit log, (3) any TODOs or obviously unfinished work you can see, \
++(4) one clear suggestion for what to work on next. Be direct and brief, like \
++a colleague catching someone up in the hallway — not a report.
++
++--- gathered context ---
++{context}
++"""
++
++
++def run(cmd: list[str], cwd: Path) -> str:
++    try:
++        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=10)
++        return (out.stdout or out.stderr or "").strip()
++    except Exception as exc:  # noqa: BLE001 - this is best-effort context, never fatal
++        return f"(unavailable: {exc})"
++
++
++def gather_context(workspace: Path) -> str:
++    parts = []
++    parts.append("git status:\n" + run(["git", "status", "--short", "--branch"], workspace))
++    parts.append("last 8 commits:\n" + run(["git", "log", "-8", "--oneline"], workspace))
++    parts.append("uncommitted diff stat:\n" + run(["git", "diff", "--stat"], workspace))
++
++    helena_md = workspace / "HELENA.md"
++    if helena_md.exists():
++        parts.append("HELENA.md:\n" + helena_md.read_text()[:2000])
++
++    todos = run(
++        ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
++         "-e", "TODO", "-e", "FIXME", "."],
++        workspace,
++    )
++    if todos and not todos.startswith("(unavailable"):
++        parts.append("TODO/FIXME hits (first 20 lines):\n" + "\n".join(todos.splitlines()[:20]))
++
++    return "\n\n".join(parts)
++
++
++def ask_helena(workspace: Path, prompt: str) -> str:
++    result = subprocess.run(
++        ["helena", "-p", prompt, "--mode", "plan", "-C", str(workspace)],
++        capture_output=True, text=True, timeout=180,
++    )
++    text = result.stdout.strip()
++    return text or "I couldn't reach the model server for a debrief — check ./start.sh."
++
++
++def speak(text: str) -> None:
++    api_key = os.environ.get("ELEVENLABS_API_KEY")
++    if api_key:
++        spoke = _speak_elevenlabs(text, api_key)
++        if spoke:
++            return
++    # Always-available fallback: macOS's built-in `say`, zero setup required.
++    subprocess.run(["say", text])
++
++
++def _speak_elevenlabs(text: str, api_key: str) -> bool:
++    try:
++        import asyncio
++        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++        from helena_harness import tts
++
++        async def _run() -> None:
++            audio = await tts.synthesize(text, api_key, os.environ.get("ELEVENLABS_VOICE_ID"))
++            await tts.play(audio)
++
++        asyncio.run(_run())
++        return True
++    except Exception as exc:  # noqa: BLE001 - fall back to `say` on any failure
++        print(f"[debrief] ElevenLabs TTS failed ({exc}), falling back to `say`.", file=sys.stderr)
++        return False
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", default=str(Path.cwd()))
++    args = parser.parse_args()
++    workspace = Path(args.workspace).expanduser()
++
++    context = gather_context(workspace)
++    prompt = DEBRIEF_PROMPT.format(context=context)
++    print("[debrief] asking HELENA…")
++    text = ask_helena(workspace, prompt)
++    print(f"[debrief] {text}")
++    speak(text)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/extras/wakeup/startup.sh b/extras/wakeup/startup.sh
+new file mode 100644
+index 0000000..196dcb1
+--- /dev/null
++++ b/extras/wakeup/startup.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++# Run at login by com.helena.wake.plist. Opens a visible Terminal window
++# running the clap listener, so you can see it's alive and read its output
++# — a listener with no window would be invisible if it silently died.
++#
++# HELENA_REPO must point at the cloned repo (edit below, or export it in
++# your shell profile before installing the LaunchAgent).
++
++HELENA_REPO="${HELENA_REPO:-$HOME/RogerCraig}"
++
++osascript <<EOF
++tell application "Terminal"
++    activate
++    do script "cd '$HELENA_REPO' && source .venv/bin/activate && python extras/wakeup/clap_listener.py --workspace '$HELENA_REPO'"
++end tell
++EOF
+diff --git a/helena_harness/web_static/index.html b/helena_harness/web_static/index.html
+new file mode 100644
+index 0000000..7ec2164
+--- /dev/null
++++ b/helena_harness/web_static/index.html
+@@ -0,0 +1,240 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<title>H.E.L.E.N.A</title>
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<style>
++  :root {
++    --bg: #05080a;
++    --panel: #0b1418;
++    --line: #123039;
++    --cyan: #4fd8e8;
++    --cyan-dim: #1c5a66;
++    --amber: #e8a94f;
++    --red: #e85f5f;
++    --text: #cfe9ee;
++    --dim: #5f8a92;
++  }
++  * { box-sizing: border-box; }
++  html, body { height: 100%; margin: 0; }
++  body {
++    background: radial-gradient(ellipse at 50% -10%, #0d2229 0%, var(--bg) 60%);
++    color: var(--text);
++    font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
++    display: flex;
++    flex-direction: column;
++    height: 100vh;
++    overflow: hidden;
++  }
++  header {
++    display: flex; align-items: center; gap: 16px;
++    padding: 14px 20px;
++    border-bottom: 1px solid var(--line);
++    background: linear-gradient(180deg, #0c1a1f, transparent);
++  }
++  .ring {
++    width: 34px; height: 34px; border-radius: 50%;
++    border: 2px solid var(--cyan-dim);
++    box-shadow: 0 0 0px var(--cyan);
++    transition: box-shadow 0.4s ease, border-color 0.4s ease;
++    flex-shrink: 0;
++  }
++  .ring.thinking { border-color: var(--amber); box-shadow: 0 0 14px var(--amber); animation: pulse 1s infinite; }
++  .ring.speaking { border-color: var(--cyan); box-shadow: 0 0 18px var(--cyan); animation: pulse 0.6s infinite; }
++  .ring.listening { border-color: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
++  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
++  h1 { font-size: 15px; letter-spacing: 0.28em; margin: 0; font-weight: 600; color: var(--cyan); }
++  .meta { font-size: 11px; color: var(--dim); margin-left: auto; text-align: right; line-height: 1.5; }
++  select {
++    background: var(--panel); color: var(--cyan); border: 1px solid var(--line);
++    font-family: inherit; font-size: 11px; padding: 4px 6px; border-radius: 4px;
++  }
++
++  #log { flex: 1; overflow-y: auto; padding: 20px 24px; }
++  .line { margin-bottom: 10px; max-width: 900px; font-size: 13.5px; line-height: 1.55; }
++  .you { color: var(--amber); }
++  .you .tag { color: var(--dim); }
++  .assistant .tag { color: var(--cyan); font-weight: 600; }
++  .notice, .warn, .error { color: var(--dim); font-size: 12px; }
++  .warn { color: var(--amber); }
++  .error { color: var(--red); }
++  .tool { font-size: 12px; color: var(--dim); border-left: 2px solid var(--cyan-dim); padding-left: 10px; margin: 6px 0; }
++  .tool.bad { border-left-color: var(--red); color: var(--red); }
++  .tool .name { color: var(--cyan); }
++
++  #inputbar { display: flex; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--line); background: #081113; }
++  #inputbar input {
++    flex: 1; background: var(--panel); border: 1px solid var(--line); color: var(--text);
++    font-family: inherit; font-size: 14px; padding: 10px 12px; border-radius: 6px; outline: none;
++  }
++  #inputbar input:focus { border-color: var(--cyan-dim); }
++  #inputbar button {
++    background: var(--cyan-dim); color: #dffbff; border: none; padding: 0 18px;
++    border-radius: 6px; font-family: inherit; cursor: pointer; letter-spacing: 0.05em;
++  }
++  #inputbar button:hover { background: var(--cyan); color: #001014; }
++
++  #permission {
++    position: fixed; inset: 0; background: rgba(3,8,10,0.85);
++    display: none; align-items: center; justify-content: center;
++  }
++  #permission.show { display: flex; }
++  .card {
++    background: var(--panel); border: 1px solid var(--amber); border-radius: 10px;
++    padding: 22px 26px; max-width: 560px; width: 90%; box-shadow: 0 0 40px rgba(232,169,79,0.15);
++  }
++  .card h2 { margin: 0 0 6px; font-size: 14px; color: var(--amber); }
++  .card .preview { font-size: 13px; margin: 10px 0; color: var(--text); }
++  .card .detail { font-size: 11.5px; color: var(--dim); white-space: pre-wrap; max-height: 160px; overflow-y: auto; margin-bottom: 14px; }
++  .card .danger { color: var(--red); font-size: 12px; margin-bottom: 10px; }
++  .choices { display: flex; gap: 8px; flex-wrap: wrap; }
++  .choices button {
++    background: transparent; border: 1px solid var(--cyan-dim); color: var(--text);
++    padding: 8px 14px; border-radius: 6px; font-family: inherit; font-size: 12px; cursor: pointer;
++  }
++  .choices button:hover { border-color: var(--cyan); color: var(--cyan); }
++  .choices button.deny { border-color: var(--red); }
++  .choices button.deny:hover { color: var(--red); }
++
++  ::-webkit-scrollbar { width: 8px; }
++  ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
++</style>
++</head>
++<body>
++
++<header>
++  <div class="ring" id="ring"></div>
++  <h1>H.E.L.E.N.A</h1>
++  <div class="meta" id="meta">connecting…</div>
++  <select id="mode">
++    <option value="ask">ask</option>
++    <option value="auto">auto</option>
++    <option value="plan">plan</option>
++    <option value="yolo">yolo</option>
++  </select>
++</header>
++
++<div id="log"></div>
++
++<div id="inputbar">
++  <input id="text" type="text" placeholder="Talk to HELENA…" autofocus>
++  <button id="send">SEND</button>
++</div>
++
++<div id="permission">
++  <div class="card">
++    <h2 id="perm-tool"></h2>
++    <div class="preview" id="perm-preview"></div>
++    <div class="danger" id="perm-danger" style="display:none"></div>
++    <div class="detail" id="perm-detail"></div>
++    <div class="choices">
++      <button data-answer="once">Yes, once</button>
++      <button data-answer="always">Always allow</button>
++      <button data-answer="session">Allow this session</button>
++      <button data-answer="no" class="deny">No</button>
++    </div>
++  </div>
++</div>
++
++<script>
++const log = document.getElementById('log');
++const ring = document.getElementById('ring');
++const meta = document.getElementById('meta');
++const modeSelect = document.getElementById('mode');
++const permission = document.getElementById('permission');
++let assistantLine = null;
++
++function append(html, cls) {
++  const div = document.createElement('div');
++  div.className = 'line ' + (cls || '');
++  div.innerHTML = html;
++  log.appendChild(div);
++  log.scrollTop = log.scrollHeight;
++  return div;
++}
++
++function setRing(state) {
++  ring.className = 'ring ' + state;
++}
++
++const ws = new WebSocket(`ws://${location.host}/ws`);
++
++ws.onopen = () => append('connected — waking HELENA…', 'notice');
++
++ws.onclose = () => { meta.textContent = 'disconnected'; append('connection closed', 'error'); };
++
++modeSelect.onchange = () => ws.send(JSON.stringify({type: 'mode', mode: modeSelect.value}));
++
++ws.onmessage = (evt) => {
++  const msg = JSON.parse(evt.data);
++  switch (msg.type) {
++    case 'ready':
++      meta.textContent = `model ${msg.model} · ${msg.workspace}`;
++      modeSelect.value = msg.mode;
++      setRing('idle');
++      append('online — say what you need.', 'notice');
++      break;
++    case 'notice': append(escapeHtml(msg.text), 'notice'); break;
++    case 'warn': append(escapeHtml(msg.text), 'warn'); break;
++    case 'error': append(escapeHtml(msg.text), 'error'); setRing('idle'); break;
++    case 'assistant_start':
++      assistantLine = append(`<span class="tag">${escapeHtml(msg.label)} </span>`, 'assistant');
++      setRing('speaking');
++      break;
++    case 'token':
++      if (assistantLine) assistantLine.innerHTML += escapeHtml(msg.text).replace(/\n/g, '<br>');
++      log.scrollTop = log.scrollHeight;
++      break;
++    case 'assistant_end':
++      assistantLine = null;
++      break;
++    case 'tool_start':
++      append(`<span class="name">${escapeHtml(msg.tool)}</span> ${escapeHtml(msg.preview)}`, 'tool');
++      break;
++    case 'tool_result':
++      append(`↳ ${escapeHtml(msg.summary || '')}`, msg.ok ? 'tool' : 'tool bad');
++      break;
++    case 'turn_done':
++      setRing('idle');
++      break;
++    case 'permission_request':
++      showPermission(msg);
++      break;
++  }
++};
++
++function showPermission(msg) {
++  document.getElementById('perm-tool').textContent = msg.tool + (msg.agent !== 'helena' ? `  (subagent: ${msg.agent})` : '');
++  document.getElementById('perm-preview').textContent = msg.preview;
++  const dangerEl = document.getElementById('perm-danger');
++  if (msg.danger) { dangerEl.style.display = 'block'; dangerEl.textContent = `⚠ this ${msg.danger}`; }
++  else { dangerEl.style.display = 'none'; }
++  document.getElementById('perm-detail').textContent = msg.detail || '';
++  permission.classList.add('show');
++}
++
++document.querySelectorAll('.choices button').forEach(btn => {
++  btn.onclick = () => {
++    ws.send(JSON.stringify({type: 'permission_answer', answer: btn.dataset.answer}));
++    permission.classList.remove('show');
++  };
++});
++
++function send() {
++  const input = document.getElementById('text');
++  const text = input.value.trim();
++  if (!text) return;
++  append(`<span class="tag">you </span>${escapeHtml(text)}`, 'you');
++  ws.send(JSON.stringify({type: 'message', text}));
++  input.value = '';
++}
++document.getElementById('send').onclick = send;
++document.getElementById('text').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
++
++function escapeHtml(s) {
++  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
++}
++</script>
++</body>
++</html>
+diff --git a/helena_harness/webui.py b/helena_harness/webui.py
+new file mode 100644
+index 0000000..639ca5f
+--- /dev/null
++++ b/helena_harness/webui.py
+@@ -0,0 +1,233 @@
++"""A local, browser-based front end for HELENA.
++
++This is NOT a replacement for `helena_harness.repl.Repl` — it's a second way
++to drive the exact same `Agent` / `PermissionEngine` machinery. It creates its
++own `ToolContext`, so it is a separate conversation from anything running in
++a terminal at the same time (same workspace, same permission *rules* file,
++independent session state). That's a deliberate simplification: sharing one
++live conversation between two front ends would mean arbitrating whose
++keystrokes win, which is a much bigger feature than "give me a UI".
++
++Run it with:
++
++    helena-web                      # http://127.0.0.1:8765
++    helena-web --port 9000 -C ~/code/some-project
++
++Everything the terminal can do, the browser can do: it sees streamed tokens,
++tool calls as they happen, and gets the same yes/always/session/no permission
++prompt — just rendered as a HUD panel instead of a `rich` panel.
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import sys
++from pathlib import Path
++from typing import Any
++
++from fastapi import FastAPI, WebSocket, WebSocketDisconnect
++from fastapi.responses import HTMLResponse
++import uvicorn
++
++from . import barehands_client as bh
++from .agent import Agent
++from .client import ServerClient, ServerError, ensure_server
++from .config import VALID_MODES, Config
++from .permissions import PermissionEngine, PermissionRequest, PermissionResult
++from .tools import build_tools
++from .tools.base import ToolContext
++from .ui import UI
++
++WEB_DIR = Path(__file__).parent / "web_static"
++
++
++class WebUI(UI):
++    """Same interface as the terminal `UI`, rendered as JSON events over a
++    WebSocket instead of `rich` console output. Every terminal method that
++    the agent loop calls is overridden here; anything not overridden (there
++    isn't much left) silently no-ops via the parent class's `quiet` guard.
++    """
++
++    def __init__(self, socket: WebSocket, config: Config) -> None:
++        super().__init__(theme=config.theme, quiet=True)  # quiet=True: skip rich rendering entirely
++        self.socket = socket
++        self.config = config
++        self._pending_permission: asyncio.Future[str] | None = None
++
++    def _send(self, payload: dict[str, Any]) -> None:
++        # Fire-and-forget from sync call sites in the agent loop; the actual
++        # socket write happens on the loop via create_task.
++        asyncio.create_task(self.socket.send_text(json.dumps(payload)))
++
++    # --- overrides the agent loop actually calls ---------------------------
++
++    def notice(self, message: str) -> None:
++        self._send({"type": "notice", "text": message})
++
++    def warn(self, message: str) -> None:
++        self._send({"type": "warn", "text": message})
++
++    def error(self, message: str) -> None:
++        self._send({"type": "error", "text": message})
++        bh.write_ring_state(self.config, "idle")
++
++    def assistant_prefix(self, label: str = "HELENA") -> None:
++        self._send({"type": "assistant_start", "label": label})
++
++    def stream_token(self, text: str) -> None:
++        self._send({"type": "token", "text": text})
++
++    def end_stream(self) -> None:
++        self._send({"type": "assistant_end"})
++
++    def tool_start(self, tool: str, preview: str) -> None:
++        self._send({"type": "tool_start", "tool": tool, "preview": preview})
++
++    def tool_result(self, tool: str, ok: bool, summary: str, detail: str = "") -> None:
++        self._send({"type": "tool_result", "tool": tool, "ok": ok, "summary": summary, "detail": detail})
++
++    def render_todos(self, todos) -> None:
++        self._send({"type": "todos", "items": list(todos)})
++
++    def usage(self, stats: dict[str, Any]) -> None:
++        self._send({"type": "usage", "stats": stats})
++
++    # --- permission prompt, rendered in the browser -------------------------
++
++    async def ask_permission(self, req: PermissionRequest, result: PermissionResult) -> str:
++        loop = asyncio.get_event_loop()
++        self._pending_permission = loop.create_future()
++        await self.socket.send_text(json.dumps({
++            "type": "permission_request",
++            "tool": req.tool,
++            "preview": req.preview,
++            "detail": req.detail,
++            "danger": result.danger,
++            "agent": req.agent,
++        }))
++        try:
++            answer = await asyncio.wait_for(self._pending_permission, timeout=600)
++        except asyncio.TimeoutError:
++            answer = "no"
++        self._pending_permission = None
++        return answer
++
++    def resolve_permission(self, answer: str) -> None:
++        if self._pending_permission and not self._pending_permission.done():
++            self._pending_permission.set_result(answer)
++
++
++class WebSession:
++    """One browser tab's conversation: its own Agent, its own ToolContext."""
++
++    def __init__(self, socket: WebSocket, config: Config) -> None:
++        self.config = config
++        self.ui = WebUI(socket, config)
++        self.client = ServerClient(config.server_url, config.api_token)
++        self.permissions = PermissionEngine(config, ask=self.ui.ask_permission)
++        self.ctx = ToolContext(
++            workspace=config.workspace,
++            config=config,
++            client=self.client,
++            permissions=self.permissions,
++            ui=self.ui,
++        )
++        self.agent = Agent(ctx=self.ctx, tools=build_tools(self.ctx), label=config.name)
++
++    async def turn(self, text: str) -> None:
++        bh.write_ring_state(self.config, "thinking")
++        try:
++            result = await self.agent.send(text)
++        except ServerError as exc:
++            self.ui.error(str(exc))
++            return
++        finally:
++            bh.write_ring_state(self.config, "idle")
++        self.ui._send({
++            "type": "turn_done",
++            "stopped": result.stopped,
++            "tool_calls": result.tool_calls,
++            "seconds": round(result.seconds, 1),
++        })
++
++    async def close(self) -> None:
++        await self.client.aclose()
++
++
++def build_app(config: Config) -> FastAPI:
++    app = FastAPI(title="HELENA web")
++
++    @app.get("/", response_class=HTMLResponse)
++    async def index() -> str:
++        return (WEB_DIR / "index.html").read_text()
++
++    @app.websocket("/ws")
++    async def ws(socket: WebSocket) -> None:
++        await socket.accept()
++        ok, note = await ensure_server(config.server_url, config.api_token, config.auto_start_server)
++        if not ok:
++            await socket.send_text(json.dumps({"type": "error", "text": f"No HELENA server: {note}"}))
++            await socket.close()
++            return
++
++        session = WebSession(socket, config)
++        await socket.send_text(json.dumps({
++            "type": "ready",
++            "model": config.model or "(server default)",
++            "workspace": str(config.workspace),
++            "mode": config.mode,
++        }))
++        try:
++            while True:
++                raw = await socket.receive_text()
++                msg = json.loads(raw)
++                if msg.get("type") == "message":
++                    await session.turn(msg.get("text", ""))
++                elif msg.get("type") == "permission_answer":
++                    session.ui.resolve_permission(msg.get("answer", "no"))
++                elif msg.get("type") == "mode":
++                    if msg.get("mode") in VALID_MODES:
++                        session.permissions.set_mode(msg["mode"])
++        except WebSocketDisconnect:
++            pass
++        finally:
++            await session.close()
++
++    return app
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(prog="helena-web", description="HELENA's browser-based HUD client.")
++    parser.add_argument("-C", "--workspace", default=None, help="Directory to work in.")
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=8765)
++    parser.add_argument("--model", default=None)
++    parser.add_argument("--server", default=None, help="HELENA server URL.")
++    parser.add_argument("--mode", choices=VALID_MODES, default=None)
++    return parser
++
++
++def main() -> None:
++    args = build_parser().parse_args()
++    workspace = Path(args.workspace).expanduser() if args.workspace else Path.cwd()
++    if not workspace.is_dir():
++        print(f"helena-web: not a directory: {workspace}", file=sys.stderr)
++        raise SystemExit(2)
++
++    config = Config.load(workspace)
++    if args.model:
++        config.model = args.model
++    if args.server:
++        config.server_url = args.server
++    if args.mode:
++        config.mode = args.mode
++
++    app = build_app(config)
++    print(f"HELENA web HUD → http://{args.host}:{args.port}  (workspace: {workspace})")
++    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/pyproject.toml b/pyproject.toml
+index c6f8ccb..81d573a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -35,10 +35,14 @@ voice = [
+ [project.scripts]
+ helena = "helena_harness.__main__:main"
+ helena-server = "helena_server.__main__:main"
++helena-web = "helena_harness.webui:main"
+ 
+ [tool.setuptools.packages.find]
+ include = ["helena_server*", "helena_harness*"]
+ 
++[tool.setuptools.package-data]
++helena_harness = ["web_static/*.html"]
++
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ asyncio_mode = "auto"

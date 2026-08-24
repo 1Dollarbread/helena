@@ -35,9 +35,13 @@ voice = [
 [project.scripts]
 helena = "helena_harness.__main__:main"
 helena-server = "helena_server.__main__:main"
+helena-web = "helena_harness.webui:main"
 
 [tool.setuptools.packages.find]
 include = ["helena_server*", "helena_harness*"]
+
+[tool.setuptools.package-data]
+helena_harness = ["web_static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
