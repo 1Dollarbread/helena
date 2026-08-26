@@ -1,0 +1,1357 @@
+diff --git a/extras/wakeup/clap_listener.py b/extras/wakeup/clap_listener.py
+index e0c61bb..3d47ece 100644
+--- a/extras/wakeup/clap_listener.py
++++ b/extras/wakeup/clap_listener.py
+@@ -7,10 +7,14 @@ already have for `/voice`:
+ 
+     pip install -e ".[voice]"
+ 
+-Tuning knobs are the constants below. Clap detection is inherently a blunt
++Tuning knobs live in `~/.helena/wake.json`, not as constants in this file —
++run `/wake-config` from inside HELENA to change them (see `wake_config.py`).
++That file is polled every couple seconds, so a running listener picks up new
++values without a restart. Deleting it, or a key inside it, falls back to the
++defaults in `wake_config.py`. Clap detection is inherently a blunt
+ instrument — a dropped book or a door slam can trigger it. Two claps in a
+ tight window cuts false positives a lot; if it's still too sensitive, raise
+-THRESHOLD first, then tighten the window.
++`threshold` first, then tighten the window.
+ 
+ Usage:
+     python clap_listener.py                      # listen forever
+@@ -28,17 +32,12 @@ from pathlib import Path
+ import numpy as np
+ import sounddevice as sd
+ 
++from wake_config import ReloadingWakeConfig, format_config
++
+ SAMPLE_RATE = 16_000
+ BLOCK_MS = 30
+ BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
+ 
+-# --- tuning --------------------------------------------------------------
+-THRESHOLD = 0.35          # RMS level (0-1 float audio) that counts as "loud"
+-REFRACTORY_S = 0.15       # ignore new spikes for this long after one fires (avoids double-counting one clap)
+-CLAP_WINDOW_S = 1.2       # both claps must land inside this window
+-COOLDOWN_S = 4.0          # after a successful wake, ignore audio for this long
+-# ---------------------------------------------------------------------------
+-
+ HERE = Path(__file__).parent
+ 
+ 
+@@ -47,20 +46,22 @@ def rms(block: np.ndarray) -> float:
+ 
+ 
+ def listen_for_double_clap(workspace: Path) -> None:
+-    print(f"[wake] listening for two claps · threshold={THRESHOLD} window={CLAP_WINDOW_S}s")
++    wake_cfg = ReloadingWakeConfig()
++    print(f"[wake] listening for two claps · {format_config(wake_cfg.get())}")
+     last_spike = 0.0
+     first_clap_at: float | None = None
+     cooldown_until = 0.0
+ 
+     def callback(indata, frames, time_info, status):  # noqa: ANN001 - sounddevice signature
+         nonlocal last_spike, first_clap_at, cooldown_until
++        cfg = wake_cfg.get()
+         now = time.monotonic()
+         if now < cooldown_until:
+             return
+         level = rms(indata[:, 0])
+-        if level < THRESHOLD:
++        if level < cfg["threshold"]:
+             return
+-        if now - last_spike < REFRACTORY_S:
++        if now - last_spike < cfg["refractory_s"]:
+             return
+         last_spike = now
+ 
+@@ -69,10 +70,10 @@ def listen_for_double_clap(workspace: Path) -> None:
+             print("[wake] clap 1…")
+             return
+ 
+-        if now - first_clap_at <= CLAP_WINDOW_S:
++        if now - first_clap_at <= cfg["clap_window_s"]:
+             print("[wake] clap 2 — waking HELENA")
+             first_clap_at = None
+-            cooldown_until = now + COOLDOWN_S
++            cooldown_until = now + cfg["cooldown_s"]
+             trigger(workspace)
+         else:
+             # too slow — this spike becomes a fresh "clap 1" instead of being dropped
+diff --git a/extras/wakeup/wake_config.py b/extras/wakeup/wake_config.py
+new file mode 100644
+index 0000000..fb5f634
+--- /dev/null
++++ b/extras/wakeup/wake_config.py
+@@ -0,0 +1,101 @@
++"""Shared tuning knobs for the clap listener.
++
++`clap_listener.py` runs as its own long-lived process (usually a launchd
++agent, see `com.helena.wake.plist`) — it isn't part of the same Python
++process as the harness, so there's no in-memory object the harness could
++just reach into. The file at `~/.helena/wake.json` is the handoff point:
++the harness's `/wake-config` command writes it, and the listener polls its
++mtime so a running listener picks up new values without a restart.
++
++Kept dependency-free (stdlib only) so importing this module never requires
++the `voice` extra that `clap_listener.py` itself needs.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++from typing import Any
++
++WAKE_CONFIG_PATH = Path(os.path.expanduser("~")) / ".helena" / "wake.json"
++
++DEFAULTS: dict[str, float] = {
++    "threshold": 0.35,      # RMS level (0-1 float audio) that counts as "loud"
++    "refractory_s": 0.15,   # ignore new spikes for this long after one fires
++    "clap_window_s": 1.2,   # both claps must land inside this window
++    "cooldown_s": 4.0,      # after a successful wake, ignore audio for this long
++}
++
++FIELDS = tuple(DEFAULTS.keys())
++
++
++def load_wake_config() -> dict[str, float]:
++    """Defaults merged with whatever's on disk. Never raises — a broken or
++    missing file just means defaults, same policy as Config._merge_file."""
++    values = dict(DEFAULTS)
++    if WAKE_CONFIG_PATH.is_file():
++        try:
++            data = json.loads(WAKE_CONFIG_PATH.read_text("utf-8"))
++        except (json.JSONDecodeError, OSError):
++            return values
++        for key in FIELDS:
++            if key in data:
++                try:
++                    values[key] = float(data[key])
++                except (TypeError, ValueError):
++                    continue
++    return values
++
++
++def save_wake_config(values: dict[str, float]) -> Path:
++    WAKE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
++    merged = load_wake_config()
++    merged.update({k: v for k, v in values.items() if k in FIELDS})
++    WAKE_CONFIG_PATH.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
++    return WAKE_CONFIG_PATH
++
++
++class ReloadingWakeConfig:
++    """Live-reloading view of the config for the listener's callback loop.
++
++    Checking the file on every audio block (30ms) would mean constant stat()
++    calls from the audio thread; instead this only re-checks mtime every
++    `poll_interval` seconds and re-reads the file if it changed.
++    """
++
++    def __init__(self, poll_interval: float = 2.0) -> None:
++        self.poll_interval = poll_interval
++        self._values = load_wake_config()
++        self._mtime = self._current_mtime()
++        self._last_poll = time.monotonic()
++
++    def _current_mtime(self) -> float:
++        try:
++            return WAKE_CONFIG_PATH.stat().st_mtime
++        except OSError:
++            return 0.0
++
++    def get(self) -> dict[str, float]:
++        now = time.monotonic()
++        if now - self._last_poll >= self.poll_interval:
++            self._last_poll = now
++            mtime = self._current_mtime()
++            if mtime != self._mtime:
++                self._mtime = mtime
++                old = dict(self._values)
++                self._values = load_wake_config()
++                if self._values != old:
++                    print(f"[wake] config reloaded: {self._values}")
++        return self._values
++
++
++def format_config(values: dict[str, float] | None = None) -> str:
++    values = values or load_wake_config()
++    return (
++        f"threshold={values['threshold']}  "
++        f"refractory_s={values['refractory_s']}  "
++        f"clap_window_s={values['clap_window_s']}  "
++        f"cooldown_s={values['cooldown_s']}"
++    )
+diff --git a/helena_harness/__main__.py b/helena_harness/__main__.py
+index 05dae23..246c054 100644
+--- a/helena_harness/__main__.py
++++ b/helena_harness/__main__.py
+@@ -23,7 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
+                "  helena                              start the interactive harness\n"
+                "  helena 'what does agent.py do?'     start with a first message\n"
+                "  helena -p 'run the tests' --mode auto   one-shot, no prompts\n"
+-               "  helena -C ~/code/api --mode plan    read-only session in another directory",
++               "  helena -C ~/code/api --mode plan    read-only session in another directory\n"
++               "  helena --attach                     join a running helena-web session instead",
+         formatter_class=argparse.RawDescriptionHelpFormatter,
+     )
+     parser.add_argument("prompt", nargs="*", help="Optional first message.")
+@@ -47,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
+                         help="Fail instead of starting a local model server.")
+     parser.add_argument("--max-iterations", type=int, default=None,
+                         help="Cap on tool-calling steps per turn.")
++    parser.add_argument("--attach", nargs="?", const="ws://127.0.0.1:8765/ws", default=None, metavar="URL",
++                        help="Attach to a running `helena-web` session instead of starting a new one "
++                             "(default: ws://127.0.0.1:8765/ws) — mirrors that browser session in this terminal.")
+     parser.add_argument("--version", action="version", version=f"helena {__version__}")
+     return parser
+ 
+@@ -135,6 +139,10 @@ def main() -> None:
+     config = apply_overrides(Config.load(workspace), args)
+     prompt = " ".join(args.prompt).strip()
+ 
++    if args.attach:
++        from .attach import run_attach
++        raise SystemExit(asyncio.run(run_attach(args.attach, config)))
++
+     if args.one_shot:
+         if not prompt and not sys.stdin.isatty():
+             prompt = sys.stdin.read().strip()
+diff --git a/helena_harness/attach.py b/helena_harness/attach.py
+new file mode 100644
+index 0000000..5840ef1
+--- /dev/null
++++ b/helena_harness/attach.py
+@@ -0,0 +1,158 @@
++"""Terminal front end that attaches to a running `helena-web` session
++instead of starting its own `Agent` — see `webui.LiveHub`'s docstring for
++why turns are serialized rather than run concurrently.
++
++This is the "mirror the terminal and the web HUD" feature: run `helena-web`
++somewhere (your Mac, wherever Ollama lives), then
++
++    helena --attach
++
++from a terminal to watch and drive the exact same conversation a browser tab
++has open. Start a task from your phone, walk over, and it's still going —
++and it'll keep streaming into the terminal too.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++
++from prompt_toolkit import PromptSession
++from prompt_toolkit.history import InMemoryHistory
++from prompt_toolkit.patch_stdout import patch_stdout
++from rich.panel import Panel
++from rich.text import Text
++
++from .config import Config
++from .ui import TOOL_ICONS, UI
++
++ANSWER_MAP = {
++    "y": "once", "yes": "once", "": "no",
++    "a": "always", "always": "always",
++    "s": "session", "session": "session",
++    "n": "no", "no": "no",
++}
++
++
++class AttachClient:
++    """Translates the same JSON event protocol `WebUI` speaks into `rich`
++    terminal output, and terminal input back into that protocol — the
++    terminal becomes one more sink on the hub's broadcast list, not a
++    separate conversation."""
++
++    def __init__(self, ui: UI) -> None:
++        self.ui = ui
++        self.socket: Any = None
++
++    async def run(self, url: str) -> int:
++        import websockets
++
++        async with websockets.connect(url) as socket:
++            self.socket = socket
++            prompt_session = PromptSession(history=InMemoryHistory())
++            recv_task = asyncio.create_task(self._receive_loop(socket))
++            try:
++                with patch_stdout():
++                    while True:
++                        try:
++                            line = (await prompt_session.prompt_async("you › ")).strip()
++                        except (EOFError, KeyboardInterrupt):
++                            break
++                        if not line:
++                            continue
++                        if line in ("/exit", "/quit"):
++                            break
++                        await socket.send(json.dumps({"type": "message", "text": line}))
++            finally:
++                recv_task.cancel()
++        return 0
++
++    async def _receive_loop(self, socket: Any) -> None:
++        async for raw in socket:
++            await self._handle(json.loads(raw))
++
++    async def _handle(self, msg: dict[str, Any]) -> None:
++        ui = self.ui
++        mtype = msg.get("type")
++        if mtype == "ready":
++            peers = ", ".join(p for p in msg.get("peers", []) if p != "terminal") or "none yet"
++            ui.notice(
++                f"attached — model {msg.get('model')} · {msg.get('workspace')} · "
++                f"mode {msg.get('mode')} · other clients: {peers}"
++            )
++        elif mtype == "history":
++            messages = msg.get("messages", [])
++            if messages:
++                ui.notice(f"caught up on {len(messages)} message(s) already in this session")
++        elif mtype == "notice":
++            ui.notice(msg.get("text", ""))
++        elif mtype == "warn":
++            ui.warn(msg.get("text", ""))
++        elif mtype == "error":
++            ui.error(msg.get("text", ""))
++        elif mtype == "assistant_start":
++            ui.assistant_prefix(msg.get("label", "HELENA"))
++        elif mtype == "token":
++            ui.stream_token(msg.get("text", ""))
++        elif mtype == "assistant_end":
++            ui.end_stream()
++        elif mtype == "tool_start":
++            ui.tool_start(msg.get("tool", ""), msg.get("preview", ""))
++        elif mtype == "tool_result":
++            ui.tool_result(msg.get("tool", ""), msg.get("ok", True), msg.get("summary", ""), msg.get("detail", ""))
++        elif mtype == "todos":
++            ui.render_todos(msg.get("items", []))
++        elif mtype == "usage":
++            ui.usage(msg.get("stats", {}))
++        elif mtype == "turn_owner":
++            source = msg.get("source")
++            if source and source != "terminal":
++                ui.notice(f"({source} sent this one — watching)")
++        elif mtype == "queued":
++            ui.notice(f"queued behind {msg.get('ahead')} — position {msg.get('position')}")
++        elif mtype == "session_loaded":
++            ui.notice(f"session switched to {msg.get('title') or msg.get('id')}")
++        elif mtype == "permission_request":
++            await self._ask_permission(msg)
++        # turn_done: usage() already printed the summary line, nothing more to show
++
++    async def _ask_permission(self, msg: dict[str, Any]) -> None:
++        ui = self.ui
++        icon = TOOL_ICONS.get(msg.get("tool", ""), "•")
++        header = Text()
++        header.append(f"{icon} {msg.get('tool', '')}", style="bold yellow")
++        if msg.get("agent") not in (None, "helena"):
++            header.append(f"  (subagent: {msg['agent']})", style="dim")
++
++        ui.console.print()
++        ui.console.print(
++            Panel(Text(msg.get("preview", ""), style="bold"), title=header, border_style="yellow", expand=False)
++        )
++        for line in (msg.get("detail") or "").splitlines()[:20]:
++            ui.console.print(Text(f"  {line}", style="dim"))
++        if msg.get("danger"):
++            ui.console.print(f"[bold red]  ⚠ This {msg['danger']}.[/bold red]")
++        ui.console.print(
++            Text("  [y] yes, once    [a] yes, always allow this    [s] yes, all session    [n] no (default)",
++                 style="dim")
++        )
++        try:
++            raw = (await PromptSession().prompt_async("  allow? ")).strip().lower()
++        except (EOFError, KeyboardInterrupt):
++            raw = "n"
++        if self.socket is not None:
++            await self.socket.send(json.dumps({"type": "permission_answer", "answer": ANSWER_MAP.get(raw, "no")}))
++
++
++async def run_attach(url: str, config: Config) -> int:
++    ui = UI(theme=config.theme)
++    ui.print(f"[dim]Attaching to {url} …[/dim]")
++    try:
++        return await AttachClient(ui).run(url)
++    except ModuleNotFoundError:
++        ui.error("The `websockets` package is needed for --attach (pip install websockets).")
++        return 1
++    except OSError as exc:
++        ui.error(f"Couldn't reach {url}: {exc}")
++        return 1
+diff --git a/helena_harness/push.py b/helena_harness/push.py
+new file mode 100644
+index 0000000..aee6bc1
+--- /dev/null
++++ b/helena_harness/push.py
+@@ -0,0 +1,133 @@
++"""Web Push notifications for the browser HUD.
++
++Lets `helena-web` notify you when a turn finishes even if the tab isn't
++focused or the laptop lid is down with the browser backgrounded — without
++running through any third-party service beyond what Web Push itself
++requires (the browser vendor's own push endpoint, e.g. Google's for Chrome —
++there's no way around that for a real background push; the message content
++and the VAPID identity that signs it stay between this machine and the
++browser).
++
++Needs the `push` extra (`pip install -e ".[push]"`, i.e. `pywebpush` +
++`cryptography`). Everything here degrades to a quiet no-op if that isn't
++installed, so `helena-web` still works without it — you just won't get
++notifications while the tab is backgrounded.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++USER_DIR = Path(os.path.expanduser("~")) / ".helena"
++VAPID_PATH = USER_DIR / "vapid.json"
++SUBSCRIPTIONS_PATH = USER_DIR / "push_subscriptions.json"
++VAPID_CLAIMS_SUB = "mailto:helena@localhost"  # required by the push protocol; never actually emailed
++
++
++def _b64url(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++def push_available() -> bool:
++    try:
++        import pywebpush  # noqa: F401
++        from cryptography.hazmat.primitives.asymmetric import ec  # noqa: F401
++    except ImportError:
++        return False
++    return True
++
++
++def _generate_vapid_keys() -> dict[str, str]:
++    from cryptography.hazmat.primitives import serialization
++    from cryptography.hazmat.primitives.asymmetric import ec
++
++    private_key = ec.generate_private_key(ec.SECP256R1())
++    private_pem = private_key.private_bytes(
++        encoding=serialization.Encoding.PEM,
++        format=serialization.PrivateFormat.PKCS8,
++        encryption_algorithm=serialization.NoEncryption(),
++    ).decode("ascii")
++    numbers = private_key.public_key().public_numbers()
++    # Browsers want the "applicationServerKey" as a raw uncompressed EC
++    # point (0x04 + 32-byte X + 32-byte Y), base64url — not the PEM form.
++    raw_point = b"\x04" + numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big")
++    return {"private_key_pem": private_pem, "public_key": _b64url(raw_point)}
++
++
++def get_vapid_keys() -> dict[str, str] | None:
++    """Generated once per machine and reused from then on — the public key
++    is what the browser pins a subscription to, so rotating it would
++    silently orphan every subscription made before the rotation."""
++    if not push_available():
++        return None
++    if VAPID_PATH.is_file():
++        try:
++            return json.loads(VAPID_PATH.read_text("utf-8"))
++        except (json.JSONDecodeError, OSError):
++            pass
++    keys = _generate_vapid_keys()
++    USER_DIR.mkdir(parents=True, exist_ok=True)
++    VAPID_PATH.write_text(json.dumps(keys, indent=2), encoding="utf-8")
++    return keys
++
++
++def _load_subscriptions() -> list[dict[str, Any]]:
++    if not SUBSCRIPTIONS_PATH.is_file():
++        return []
++    try:
++        data = json.loads(SUBSCRIPTIONS_PATH.read_text("utf-8"))
++    except (json.JSONDecodeError, OSError):
++        return []
++    return data if isinstance(data, list) else []
++
++
++def _save_subscriptions(subs: list[dict[str, Any]]) -> None:
++    USER_DIR.mkdir(parents=True, exist_ok=True)
++    SUBSCRIPTIONS_PATH.write_text(json.dumps(subs, indent=2), encoding="utf-8")
++
++
++def add_subscription(subscription_info: dict[str, Any]) -> None:
++    subs = _load_subscriptions()
++    if not any(s.get("endpoint") == subscription_info.get("endpoint") for s in subs):
++        subs.append(subscription_info)
++        _save_subscriptions(subs)
++
++
++def remove_subscription(endpoint: str) -> None:
++    subs = [s for s in _load_subscriptions() if s.get("endpoint") != endpoint]
++    _save_subscriptions(subs)
++
++
++def notify_all(title: str, body: str, tag: str = "helena-turn") -> None:
++    """Best-effort and synchronous (pywebpush shells out to `requests`) —
++    call this via `asyncio.to_thread` from async code. A dead subscription
++    (410/404 from the push service — the browser un-subscribed, or the
++    profile was removed) is dropped so it isn't retried forever; anything
++    else is just logged, since a failed notification should never take down
++    the turn that triggered it."""
++    if not push_available() or not _load_subscriptions():
++        return
++    from pywebpush import WebPushException, webpush
++
++    keys = get_vapid_keys()
++    if not keys:
++        return
++    payload = json.dumps({"title": title, "body": body, "tag": tag})
++    for sub in _load_subscriptions():
++        try:
++            webpush(
++                subscription_info=sub,
++                data=payload,
++                vapid_private_key=keys["private_key_pem"],
++                vapid_claims={"sub": VAPID_CLAIMS_SUB},
++            )
++        except WebPushException as exc:
++            status = getattr(getattr(exc, "response", None), "status_code", None)
++            if status in (404, 410):
++                remove_subscription(sub.get("endpoint", ""))
++            else:
++                print(f"[push] delivery failed: {exc}")
+diff --git a/helena_harness/repl.py b/helena_harness/repl.py
+index 124131c..7aab558 100644
+--- a/helena_harness/repl.py
++++ b/helena_harness/repl.py
+@@ -73,6 +73,7 @@ COMMANDS: dict[str, str] = {
+     "/barehands-setup": "Clone, start, and connect the barehands hand-tracked board",
+     "/board": "Send a raw board command — /board present src=models/car.glb title=\"My Car\"",
+     "/board-state": "Show what's actually on the barehands board right now",
++    "/wake-config": "Show or tune the clap listener — /wake-config set threshold 0.4",
+     "/exit": "Quit (Ctrl-D also works)",
+ }
+ 
+@@ -380,6 +381,7 @@ class Repl:
+             "/barehands-setup": self.cmd_barehands_setup,
+             "/board": self.cmd_board,
+             "/board-state": self.cmd_board_state,
++            "/wake-config": self.cmd_wake_config,
+         }
+         handler = handlers.get(cmd)
+         if not handler:
+@@ -1150,3 +1152,53 @@ here is bundled into HELENA itself.
+             self.ui.error(str(exc))
+             return
+         self.ui.print(bh.describe_state(state))
++
++    def cmd_wake_config(self, args: list[str]) -> None:
++        """Tune the clap listener from inside HELENA instead of editing
++        clap_listener.py by hand. Writes to ~/.helena/wake.json, which a
++        running listener process polls and picks up on its own — see
++        extras/wakeup/wake_config.py for why it works that way (the listener
++        is a separate long-lived process, not part of this one)."""
++        # extras/wakeup isn't part of the installed package (see pyproject's
++        # packages.find) — it's a repo-relative folder, so it's only
++        # reachable when running from a checkout. Reached via sys.path
++        # rather than a dotted import so this doesn't require extras/ to be
++        # a formal package.
++        wakeup_dir = Path(__file__).resolve().parent.parent / "extras" / "wakeup"
++        if str(wakeup_dir) not in sys.path:
++            sys.path.insert(0, str(wakeup_dir))
++        try:
++            from wake_config import DEFAULTS, FIELDS, format_config, save_wake_config
++        except ImportError:
++            self.ui.warn(
++                f"Couldn't find wake_config.py under {wakeup_dir} — this command needs a repo checkout, "
++                "not just the installed package."
++            )
++            return
++
++        if not args or args[0] == "show":
++            self.ui.print(f"Wake listener config: [bold]{format_config()}[/bold]")
++            self.ui.notice(
++                "/wake-config set <threshold|refractory_s|clap_window_s|cooldown_s> <value> · "
++                "/wake-config reset. Takes effect on a running listener within a couple seconds — "
++                "no restart needed."
++            )
++            return
++        if args[0] == "reset":
++            save_wake_config(DEFAULTS)
++            self.ui.print(f"Reset to defaults: [bold]{format_config()}[/bold]")
++            return
++        if args[0] == "set" and len(args) == 3:
++            field, raw_value = args[1], args[2]
++            if field not in FIELDS:
++                self.ui.warn(f"Unknown field {field!r}. Valid fields: {', '.join(FIELDS)}")
++                return
++            try:
++                value = float(raw_value)
++            except ValueError:
++                self.ui.warn(f"{raw_value!r} isn't a number.")
++                return
++            save_wake_config({field: value})
++            self.ui.print(f"Set {field} = {value}. Current config: [bold]{format_config()}[/bold]")
++            return
++        self.ui.warn("Usage: /wake-config [show | set <field> <value> | reset]")
+diff --git a/helena_harness/web_static/index.html b/helena_harness/web_static/index.html
+index 7ec2164..409b5b0 100644
+--- a/helena_harness/web_static/index.html
++++ b/helena_harness/web_static/index.html
+@@ -23,16 +23,52 @@
+     color: var(--text);
+     font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+     display: flex;
+-    flex-direction: column;
+     height: 100vh;
+     overflow: hidden;
+   }
++
++  /* --- sidebar: session history --- */
++  #sidebar {
++    width: 240px; flex-shrink: 0;
++    border-right: 1px solid var(--line);
++    background: #081113;
++    display: flex; flex-direction: column;
++    transition: margin-left 0.2s ease;
++  }
++  #sidebar.collapsed { margin-left: -240px; }
++  #sidebar-header {
++    display: flex; align-items: center; justify-content: space-between;
++    padding: 12px 14px; border-bottom: 1px solid var(--line);
++  }
++  #sidebar-header span { font-size: 11px; letter-spacing: 0.1em; color: var(--dim); }
++  #new-session {
++    background: var(--cyan-dim); color: #dffbff; border: none; padding: 4px 8px;
++    border-radius: 4px; font-family: inherit; font-size: 11px; cursor: pointer;
++  }
++  #new-session:hover { background: var(--cyan); color: #001014; }
++  #sessions { flex: 1; overflow-y: auto; padding: 6px; }
++  .session-item {
++    padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 4px;
++    font-size: 12px; line-height: 1.4;
++  }
++  .session-item:hover { background: var(--panel); }
++  .session-item.active { background: var(--cyan-dim); }
++  .session-item .title { color: var(--text); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++  .session-item .meta { color: var(--dim); font-size: 10.5px; }
++
++  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
++
+   header {
+     display: flex; align-items: center; gap: 16px;
+     padding: 14px 20px;
+     border-bottom: 1px solid var(--line);
+     background: linear-gradient(180deg, #0c1a1f, transparent);
+   }
++  #sidebar-toggle {
++    background: transparent; border: 1px solid var(--line); color: var(--dim);
++    border-radius: 4px; padding: 4px 8px; cursor: pointer; font-family: inherit;
++  }
++  #sidebar-toggle:hover { color: var(--cyan); border-color: var(--cyan-dim); }
+   .ring {
+     width: 34px; height: 34px; border-radius: 50%;
+     border: 2px solid var(--cyan-dim);
+@@ -46,10 +82,11 @@
+   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+   h1 { font-size: 15px; letter-spacing: 0.28em; margin: 0; font-weight: 600; color: var(--cyan); }
+   .meta { font-size: 11px; color: var(--dim); margin-left: auto; text-align: right; line-height: 1.5; }
+-  select {
++  select, #bell {
+     background: var(--panel); color: var(--cyan); border: 1px solid var(--line);
+-    font-family: inherit; font-size: 11px; padding: 4px 6px; border-radius: 4px;
++    font-family: inherit; font-size: 11px; padding: 4px 6px; border-radius: 4px; cursor: pointer;
+   }
++  #bell.on { color: var(--amber); border-color: var(--amber); }
+ 
+   #log { flex: 1; overflow-y: auto; padding: 20px 24px; }
+   .line { margin-bottom: 10px; max-width: 900px; font-size: 13.5px; line-height: 1.55; }
+@@ -103,10 +140,21 @@
+ </head>
+ <body>
+ 
++<div id="sidebar">
++  <div id="sidebar-header">
++    <span>SESSIONS</span>
++    <button id="new-session">+ NEW</button>
++  </div>
++  <div id="sessions"></div>
++</div>
++
++<div id="main">
+ <header>
++  <button id="sidebar-toggle">☰</button>
+   <div class="ring" id="ring"></div>
+   <h1>H.E.L.E.N.A</h1>
+   <div class="meta" id="meta">connecting…</div>
++  <button id="bell" title="Notify me when a turn finishes and this tab isn't focused">🔔 off</button>
+   <select id="mode">
+     <option value="ask">ask</option>
+     <option value="auto">auto</option>
+@@ -121,6 +169,7 @@
+   <input id="text" type="text" placeholder="Talk to HELENA…" autofocus>
+   <button id="send">SEND</button>
+ </div>
++</div>
+ 
+ <div id="permission">
+   <div class="card">
+@@ -143,7 +192,11 @@ const ring = document.getElementById('ring');
+ const meta = document.getElementById('meta');
+ const modeSelect = document.getElementById('mode');
+ const permission = document.getElementById('permission');
++const sidebar = document.getElementById('sidebar');
++const sessionsEl = document.getElementById('sessions');
++const bell = document.getElementById('bell');
+ let assistantLine = null;
++let currentSessionId = null;
+ 
+ function append(html, cls) {
+   const div = document.createElement('div');
+@@ -158,9 +211,107 @@ function setRing(state) {
+   ring.className = 'ring ' + state;
+ }
+ 
+-const ws = new WebSocket(`ws://${location.host}/ws`);
++function escapeHtml(s) {
++  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
++}
++
++// --- session sidebar --------------------------------------------------
++
++async function refreshSessions() {
++  try {
++    const res = await fetch('/api/sessions');
++    const rows = await res.json();
++    sessionsEl.innerHTML = '';
++    rows.forEach(r => {
++      const div = document.createElement('div');
++      div.className = 'session-item' + (r.id === currentSessionId ? ' active' : '');
++      div.innerHTML = `<span class="title">${escapeHtml(r.title || '(untitled)')}</span>` +
++                      `<span class="meta">${r.age} · ${r.messages} msgs</span>`;
++      div.onclick = () => ws.send(JSON.stringify({type: 'load_session', id: r.id}));
++      sessionsEl.appendChild(div);
++    });
++  } catch (e) { /* server may not be up yet on first paint */ }
++}
++
++document.getElementById('sidebar-toggle').onclick = () => sidebar.classList.toggle('collapsed');
++document.getElementById('new-session').onclick = () => ws.send(JSON.stringify({type: 'new_session'}));
++
++function renderHistory(messages) {
++  log.innerHTML = '';
++  (messages || []).forEach(m => {
++    if (m.role === 'user' && typeof m.content === 'string') {
++      append(`<span class="tag">you </span>${escapeHtml(m.content)}`, 'you');
++    } else if (m.role === 'assistant' && typeof m.content === 'string' && m.content) {
++      append(`<span class="tag">HELENA </span>${escapeHtml(m.content).replace(/\n/g, '<br>')}`, 'assistant');
++    }
++  });
++}
++
++// --- push notifications -------------------------------------------------
+ 
+-ws.onopen = () => append('connected — waking HELENA…', 'notice');
++function urlBase64ToUint8Array(base64String) {
++  const padding = '='.repeat((4 - base64String.length % 4) % 4);
++  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
++  const raw = atob(base64);
++  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
++}
++
++async function enablePush() {
++  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
++    append('push notifications aren\'t supported in this browser', 'warn');
++    return;
++  }
++  const perm = await Notification.requestPermission();
++  if (perm !== 'granted') { append('notification permission denied', 'warn'); return; }
++  try {
++    const reg = await navigator.serviceWorker.register('/sw.js');
++    const keyRes = await fetch('/push/vapid-public-key');
++    if (!keyRes.ok) {
++      append('push needs the server\'s push extra installed (pip install -e ".[push]")', 'warn');
++      return;
++    }
++    const { key } = await keyRes.json();
++    const sub = await reg.pushManager.subscribe({
++      userVisibleOnly: true,
++      applicationServerKey: urlBase64ToUint8Array(key),
++    });
++    await fetch('/push/subscribe', {
++      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(sub),
++    });
++    bell.classList.add('on');
++    bell.textContent = '🔔 on';
++    append('notifications on — you\'ll get one when a turn finishes and this tab is backgrounded', 'notice');
++  } catch (e) {
++    append('couldn\'t enable notifications: ' + e, 'warn');
++  }
++}
++
++bell.onclick = () => {
++  if (bell.classList.contains('on')) {
++    bell.classList.remove('on'); bell.textContent = '🔔 off';
++    // subscription itself is left registered server-side; toggling here just
++    // stops asking for permission again this tab. Revoke via the browser's
++    // own site-settings to fully unsubscribe.
++  } else {
++    enablePush();
++  }
++};
++
++document.addEventListener('visibilitychange', () => {
++  if (ws.readyState === WebSocket.OPEN) {
++    ws.send(JSON.stringify({type: 'visibility', hidden: document.hidden}));
++  }
++});
++
++// --- websocket ------------------------------------------------------------
++
++const ws = new WebSocket(`ws://${location.host}/ws?client=web`);
++
++ws.onopen = () => {
++  append('connected — waking HELENA…', 'notice');
++  refreshSessions();
++  ws.send(JSON.stringify({type: 'visibility', hidden: document.hidden}));
++};
+ 
+ ws.onclose = () => { meta.textContent = 'disconnected'; append('connection closed', 'error'); };
+ 
+@@ -173,11 +324,25 @@ ws.onmessage = (evt) => {
+       meta.textContent = `model ${msg.model} · ${msg.workspace}`;
+       modeSelect.value = msg.mode;
+       setRing('idle');
+-      append('online — say what you need.', 'notice');
++      const others = (msg.peers || []).filter(p => p !== 'web');
++      append('online — say what you need.' + (others.length ? ` (also attached: ${others.join(', ')})` : ''), 'notice');
++      break;
++    case 'history':
++      renderHistory(msg.messages);
++      break;
++    case 'session_loaded':
++      currentSessionId = msg.id;
++      renderHistory(msg.messages);
++      append(`— session: ${escapeHtml(msg.title || msg.id)} —`, 'notice');
++      refreshSessions();
+       break;
+     case 'notice': append(escapeHtml(msg.text), 'notice'); break;
+     case 'warn': append(escapeHtml(msg.text), 'warn'); break;
+     case 'error': append(escapeHtml(msg.text), 'error'); setRing('idle'); break;
++    case 'queued': append(`queued behind ${escapeHtml(msg.ahead)} — position ${msg.position}`, 'notice'); break;
++    case 'turn_owner':
++      if (msg.source && msg.source !== 'web') append(`(${escapeHtml(msg.source)} sent this one)`, 'notice');
++      break;
+     case 'assistant_start':
+       assistantLine = append(`<span class="tag">${escapeHtml(msg.label)} </span>`, 'assistant');
+       setRing('speaking');
+@@ -197,6 +362,7 @@ ws.onmessage = (evt) => {
+       break;
+     case 'turn_done':
+       setRing('idle');
++      refreshSessions();
+       break;
+     case 'permission_request':
+       showPermission(msg);
+@@ -231,10 +397,6 @@ function send() {
+ }
+ document.getElementById('send').onclick = send;
+ document.getElementById('text').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+-
+-function escapeHtml(s) {
+-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+-}
+ </script>
+ </body>
+ </html>
+diff --git a/helena_harness/web_static/sw.js b/helena_harness/web_static/sw.js
+new file mode 100644
+index 0000000..aed1cf7
+--- /dev/null
++++ b/helena_harness/web_static/sw.js
+@@ -0,0 +1,39 @@
++// Minimal service worker for HELENA's web HUD — just enough to receive a
++// Web Push event while the tab isn't focused and show a notification for
++// it. No caching, no offline support; this isn't a PWA, just a delivery
++// point for pushes the FastAPI server sends via helena_harness/push.py.
++
++self.addEventListener('install', (event) => {
++  self.skipWaiting();
++});
++
++self.addEventListener('activate', (event) => {
++  event.waitUntil(self.clients.claim());
++});
++
++self.addEventListener('push', (event) => {
++  let data = { title: 'H.E.L.E.N.A', body: 'A turn finished.', tag: 'helena-turn' };
++  if (event.data) {
++    try { data = { ...data, ...event.data.json() }; } catch (e) { /* fall back to defaults */ }
++  }
++  event.waitUntil(
++    self.registration.showNotification(data.title, {
++      body: data.body,
++      tag: data.tag,
++      icon: undefined,
++      renotify: true,
++    })
++  );
++});
++
++self.addEventListener('notificationclick', (event) => {
++  event.notification.close();
++  event.waitUntil(
++    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
++      for (const client of clientList) {
++        if ('focus' in client) return client.focus();
++      }
++      if (self.clients.openWindow) return self.clients.openWindow('/');
++    })
++  );
++});
+diff --git a/helena_harness/webui.py b/helena_harness/webui.py
+index a45ec30..a560394 100644
+--- a/helena_harness/webui.py
++++ b/helena_harness/webui.py
+@@ -1,12 +1,12 @@
+ """A local, browser-based front end for HELENA.
+ 
+-This is NOT a replacement for `helena_harness.repl.Repl` — it's a second way
+-to drive the exact same `Agent` / `PermissionEngine` machinery. It creates its
+-own `ToolContext`, so it is a separate conversation from anything running in
+-a terminal at the same time (same workspace, same permission *rules* file,
+-independent session state). That's a deliberate simplification: sharing one
+-live conversation between two front ends would mean arbitrating whose
+-keystrokes win, which is a much bigger feature than "give me a UI".
++This drives the exact same `Agent` / `PermissionEngine` machinery as the
++terminal `Repl` — but unlike the terminal, every browser tab (and, in
++`--attach` mode, a terminal too) that connects to a running `helena-web`
++process joins *one shared* `LiveHub`, not a conversation of its own. That's
++what makes "start a task on your phone and watch it continue on your
++laptop's terminal" possible: whichever front end connects first spins up the
++`Agent`; everyone after that is just another view onto it.
+ 
+ Run it with:
+ 
+@@ -15,7 +15,8 @@ Run it with:
+ 
+ Everything the terminal can do, the browser can do: it sees streamed tokens,
+ tool calls as they happen, and gets the same yes/always/session/no permission
+-prompt — just rendered as a HUD panel instead of a `rich` panel.
++prompt — just rendered as a HUD panel instead of a `rich` panel. A terminal
++can join the same session with `helena --attach` (see `attach.py`).
+ """
+ 
+ from __future__ import annotations
+@@ -27,15 +28,17 @@ import sys
+ from pathlib import Path
+ from typing import Any
+ 
+-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+-from fastapi.responses import HTMLResponse
++from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
++from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+ import uvicorn
+ 
+ from . import barehands_client as bh
++from . import push
+ from .agent import Agent
+ from .client import ServerClient, ServerError, ensure_server
+ from .config import VALID_MODES, Config
+ from .permissions import PermissionEngine, PermissionRequest, PermissionResult
++from .session import Transcript, find_transcript, list_transcripts
+ from .tools import build_tools
+ from .tools.base import ToolContext
+ from .ui import UI
+@@ -44,29 +47,23 @@ WEB_DIR = Path(__file__).parent / "web_static"
+ 
+ 
+ class WebUI(UI):
+-    """Same interface as the terminal `UI`, rendered as JSON events over a
+-    WebSocket instead of `rich` console output. Every terminal method that
++    """Same interface as the terminal `UI`, rendered as JSON events over
++    WebSockets instead of `rich` console output. Every terminal method that
+     the agent loop calls is overridden here; anything not overridden (there
+     isn't much left) silently no-ops via the parent class's `quiet` guard.
++
++    Broadcasts to every socket attached to the hub, not just one — that's
++    the mechanism behind session mirroring: a token streamed once reaches
++    every attached tab and terminal at once.
+     """
+ 
+-    def __init__(self, socket: WebSocket, config: Config) -> None:
+-        super().__init__(theme=config.theme, quiet=True)  # quiet=True: skip rich rendering entirely
+-        self.socket = socket
+-        self.config = config
++    def __init__(self, hub: "LiveHub") -> None:
++        super().__init__(theme=hub.config.theme, quiet=True)  # quiet=True: skip rich rendering entirely
++        self.hub = hub
+         self._pending_permission: asyncio.Future[str] | None = None
+ 
+     def _send(self, payload: dict[str, Any]) -> None:
+-        # Fire-and-forget from sync call sites in the agent loop; the actual
+-        # socket write happens on the loop via create_task. Swallow failures
+-        # here — if the socket's already gone, there's nothing left to do,
+-        # and letting the exception surface just spams the terminal.
+-        async def _write() -> None:
+-            try:
+-                await self.socket.send_text(json.dumps(payload))
+-            except Exception:
+-                pass
+-        asyncio.create_task(_write())
++        self.hub.broadcast(payload)
+ 
+     # --- overrides the agent loop actually calls ---------------------------
+ 
+@@ -78,7 +75,7 @@ class WebUI(UI):
+ 
+     def error(self, message: str) -> None:
+         self._send({"type": "error", "text": message})
+-        bh.write_ring_state(self.config, "idle")
++        bh.write_ring_state(self.hub.config, "idle")
+ 
+     def assistant_prefix(self, label: str = "HELENA") -> None:
+         self._send({"type": "assistant_start", "label": label})
+@@ -101,19 +98,23 @@ class WebUI(UI):
+     def usage(self, stats: dict[str, Any]) -> None:
+         self._send({"type": "usage", "stats": stats})
+ 
+-    # --- permission prompt, rendered in the browser -------------------------
++    # --- permission prompt, rendered by every attached front end -----------
++    # Only one turn (and so one pending permission) is ever in flight at a
++    # time — see LiveHub — so broadcasting the request and letting whichever
++    # front end responds first win is safe and simple: no arbitration needed
++    # beyond "first answer resolves it."
+ 
+     async def ask_permission(self, req: PermissionRequest, result: PermissionResult) -> str:
+         loop = asyncio.get_event_loop()
+         self._pending_permission = loop.create_future()
+-        await self.socket.send_text(json.dumps({
++        self.hub.broadcast({
+             "type": "permission_request",
+             "tool": req.tool,
+             "preview": req.preview,
+             "detail": req.detail,
+             "danger": result.danger,
+             "agent": req.agent,
+-        }))
++        })
+         try:
+             answer = await asyncio.wait_for(self._pending_permission, timeout=600)
+         except asyncio.TimeoutError:
+@@ -126,12 +127,24 @@ class WebUI(UI):
+             self._pending_permission.set_result(answer)
+ 
+ 
+-class WebSession:
+-    """One browser tab's conversation: its own Agent, its own ToolContext."""
++class LiveHub:
++    """The one shared conversation for a running `helena-web` process: one
++    `Agent`, one `ToolContext`, any number of attached sockets (browser tabs
++    and/or an attached terminal).
++
++    Turns are serialized through a FIFO queue rather than run concurrently.
++    Letting two front ends drive turns at once would mean interleaving tool
++    calls, streamed tokens, and permission prompts from two "speakers" into
++    one conversation — a much bigger problem than picking whose keystrokes
++    win. First-come-first-served, with a "queued behind <source>" notice for
++    anyone who has to wait, is a small price for that being simple and safe.
++    """
+ 
+-    def __init__(self, socket: WebSocket, config: Config) -> None:
++    def __init__(self, config: Config) -> None:
+         self.config = config
+-        self.ui = WebUI(socket, config)
++        self.sockets: list[tuple[WebSocket, str]] = []
++        self._hidden: dict[int, bool] = {}
++        self.ui = WebUI(self)
+         self.client = ServerClient(config.server_url, config.api_token)
+         self.permissions = PermissionEngine(config, ask=self.ui.ask_permission)
+         self.ctx = ToolContext(
+@@ -142,39 +155,157 @@ class WebSession:
+             ui=self.ui,
+         )
+         self.agent = Agent(ctx=self.ctx, tools=build_tools(self.ctx), label=config.name)
++        self.transcript = Transcript.new(config.transcript_dir, model=config.model)
++        self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
++        self._busy_source: str | None = None
++        self._worker = asyncio.create_task(self._drain())
++
++    # --- socket bookkeeping -------------------------------------------------
++
++    def join(self, socket: WebSocket, label: str) -> None:
++        self.sockets.append((socket, label))
++        self._hidden[id(socket)] = False
++
++    def leave(self, socket: WebSocket) -> None:
++        self.sockets = [(s, l) for s, l in self.sockets if s is not socket]
++        self._hidden.pop(id(socket), None)
++
++    def set_hidden(self, socket: WebSocket, hidden: bool) -> None:
++        self._hidden[id(socket)] = hidden
++
++    @property
++    def peers(self) -> list[str]:
++        return [label for _, label in self.sockets]
++
++    @property
++    def all_hidden(self) -> bool:
++        """True if every attached front end is backgrounded (or none are
++        attached at all) — the signal to send a push notification instead
++        of relying on someone watching the screen."""
++        return all(self._hidden.values()) if self._hidden else True
++
++    def broadcast(self, payload: dict[str, Any]) -> None:
++        for socket, _ in list(self.sockets):
++            asyncio.create_task(self._safe_send(socket, payload))
++
++    @staticmethod
++    async def _safe_send(socket: WebSocket, payload: dict[str, Any]) -> None:
++        try:
++            await socket.send_text(json.dumps(payload))
++        except Exception:
++            pass  # socket's already gone — nothing left to do
++
++    # --- turns ---------------------------------------------------------------
++
++    async def submit(self, text: str, source: str) -> None:
++        pending = self._queue.qsize()
++        if self._busy_source is not None or pending:
++            self.broadcast({
++                "type": "queued",
++                "position": pending + 1,
++                "ahead": self._busy_source or "another message",
++            })
++        await self._queue.put((text, source))
++
++    async def _drain(self) -> None:
++        while True:
++            text, source = await self._queue.get()
++            self._busy_source = source
++            self.broadcast({"type": "turn_owner", "source": source})
++            try:
++                await self._run_turn(text)
++            finally:
++                self._busy_source = None
++                self._queue.task_done()
+ 
+-    async def turn(self, text: str) -> None:
++    async def _run_turn(self, text: str) -> None:
+         bh.write_ring_state(self.config, "thinking")
++        result = None
+         try:
+             result = await self.agent.send(text)
+         except ServerError as exc:
+             self.ui.error(str(exc))
+-            return
+-        except Exception as exc:  # surface it instead of killing the socket
++        except Exception as exc:  # surface it instead of killing every socket
+             import traceback
+             traceback.print_exc()
+             self.ui.error(f"Internal error: {exc}")
+-            return
+         finally:
+             bh.write_ring_state(self.config, "idle")
+-        self.ui._send({
+-            "type": "turn_done",
+-            "stopped": result.stopped,
+-            "tool_calls": result.tool_calls,
+-            "seconds": round(result.seconds, 1),
+-        })
++
++        self.transcript.save(self.agent.messages, self.agent.totals)
++
++        if result is not None:
++            self.broadcast({
++                "type": "turn_done",
++                "stopped": result.stopped,
++                "tool_calls": result.tool_calls,
++                "seconds": round(result.seconds, 1),
++            })
++            summary = (result.text or result.error or "").strip()
++        else:
++            summary = "the turn hit an error — check the HUD for details"
++
++        if self.all_hidden:
++            preview = " ".join(summary.split())[:140] or "turn complete"
++            await asyncio.to_thread(push.notify_all, f"{self.config.name} finished", preview)
++
++    # --- sessions --------------------------------------------------------------
++
++    def load_session(self, transcript: Transcript) -> None:
++        self.agent.messages = [m for m in transcript.messages if not m.get("images")]
++        self.transcript = transcript
++
++    def new_session(self) -> None:
++        self.agent.messages.clear()
++        self.ctx.todos.clear()
++        self.transcript = Transcript.new(self.config.transcript_dir, model=self.config.model)
+ 
+     async def close(self) -> None:
++        self._worker.cancel()
+         await self.client.aclose()
+ 
+ 
+ def build_app(config: Config) -> FastAPI:
+     app = FastAPI(title="HELENA web")
++    state: dict[str, LiveHub] = {}
++
++    def get_hub() -> LiveHub:
++        if "hub" not in state:
++            state["hub"] = LiveHub(config)
++        return state["hub"]
+ 
+     @app.get("/", response_class=HTMLResponse)
+     async def index() -> str:
+         return (WEB_DIR / "index.html").read_text()
+ 
++    @app.get("/sw.js")
++    async def service_worker() -> FileResponse:
++        return FileResponse(WEB_DIR / "sw.js", media_type="application/javascript")
++
++    @app.get("/api/sessions")
++    async def api_sessions() -> list[dict[str, Any]]:
++        return list_transcripts(config.transcript_dir)
++
++    @app.get("/push/vapid-public-key")
++    async def vapid_public_key() -> JSONResponse:
++        keys = push.get_vapid_keys()
++        if not keys:
++            return JSONResponse(
++                {"error": "push extra not installed — pip install -e \".[push]\""}, status_code=503
++            )
++        return JSONResponse({"key": keys["public_key"]})
++
++    @app.post("/push/subscribe")
++    async def push_subscribe(request: Request) -> dict[str, bool]:
++        push.add_subscription(await request.json())
++        return {"ok": True}
++
++    @app.post("/push/unsubscribe")
++    async def push_unsubscribe(request: Request) -> dict[str, bool]:
++        data = await request.json()
++        push.remove_subscription(data.get("endpoint", ""))
++        return {"ok": True}
++
+     @app.websocket("/ws")
+     async def ws(socket: WebSocket) -> None:
+         await socket.accept()
+@@ -184,28 +315,67 @@ def build_app(config: Config) -> FastAPI:
+             await socket.close()
+             return
+ 
+-        session = WebSession(socket, config)
++        label = socket.query_params.get("client") or "web"
++        is_first = "hub" not in state
++        hub = get_hub()
++        hub.join(socket, label)
++
+         await socket.send_text(json.dumps({
+             "type": "ready",
+             "model": config.model or "(server default)",
+             "workspace": str(config.workspace),
+             "mode": config.mode,
++            "peers": hub.peers,
+         }))
++        if not is_first and hub.agent.messages:
++            # Joining a session already in progress — catch this front end
++            # up on what happened before it connected.
++            await socket.send_text(json.dumps({"type": "history", "messages": hub.agent.messages}))
++
+         try:
+             while True:
+                 raw = await socket.receive_text()
+                 msg = json.loads(raw)
+-                if msg.get("type") == "message":
+-                    await session.turn(msg.get("text", ""))
+-                elif msg.get("type") == "permission_answer":
+-                    session.ui.resolve_permission(msg.get("answer", "no"))
+-                elif msg.get("type") == "mode":
++                mtype = msg.get("type")
++                if mtype == "message":
++                    await hub.submit(msg.get("text", ""), label)
++                elif mtype == "permission_answer":
++                    hub.ui.resolve_permission(msg.get("answer", "no"))
++                elif mtype == "mode":
+                     if msg.get("mode") in VALID_MODES:
+-                        session.permissions.set_mode(msg["mode"])
++                        hub.permissions.set_mode(msg["mode"])
++                elif mtype == "visibility":
++                    hub.set_hidden(socket, bool(msg.get("hidden")))
++                elif mtype == "load_session":
++                    path = find_transcript(config.transcript_dir, msg.get("id") or "last")
++                    if not path:
++                        await socket.send_text(json.dumps(
++                            {"type": "warn", "text": f"No session matching {msg.get('id')!r}."}
++                        ))
++                        continue
++                    hub.load_session(Transcript.load(path))
++                    hub.broadcast({
++                        "type": "session_loaded",
++                        "id": hub.transcript.id,
++                        "title": hub.transcript.title,
++                        "messages": hub.agent.messages,
++                    })
++                elif mtype == "new_session":
++                    hub.new_session()
++                    hub.broadcast({
++                        "type": "session_loaded",
++                        "id": hub.transcript.id,
++                        "title": "(new session)",
++                        "messages": [],
++                    })
+         except WebSocketDisconnect:
+             pass
+         finally:
+-            await session.close()
++            hub.leave(socket)
++            # The hub (and its Agent) stays alive after the last socket
++            # leaves — that's what lets you close every tab and terminal,
++            # reopen the browser later, and reattach to the same session
++            # instead of it vanishing with the last connection.
+ 
+     return app
+ 
+@@ -238,6 +408,8 @@ def main() -> None:
+ 
+     app = build_app(config)
+     print(f"HELENA web HUD → http://{args.host}:{args.port}  (workspace: {workspace})")
++    if not push.push_available():
++        print("[push] pywebpush not installed — notifications disabled (pip install -e \".[push]\" to enable)")
+     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+ 
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 81d573a..52f9a36 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -19,6 +19,7 @@ dependencies = [
+     "python-multipart>=0.0.9",
+     "prompt_toolkit>=3.0.43",
+     "rich>=13.7",
++    "websockets>=12.0",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -31,6 +32,9 @@ voice = [
+     "sounddevice>=0.4.6",
+     "numpy>=1.24",
+ ]
++push = [
++    "pywebpush>=2.0",
++]
+ 
+ [project.scripts]
+ helena = "helena_harness.__main__:main"
+@@ -41,7 +45,7 @@ helena-web = "helena_harness.webui:main"
+ include = ["helena_server*", "helena_harness*"]
+ 
+ [tool.setuptools.package-data]
+-helena_harness = ["web_static/*.html"]
++helena_harness = ["web_static/*.html", "web_static/*.js"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]

@@ -7,10 +7,14 @@ already have for `/voice`:
 
     pip install -e ".[voice]"
 
-Tuning knobs are the constants below. Clap detection is inherently a blunt
+Tuning knobs live in `~/.helena/wake.json`, not as constants in this file —
+run `/wake-config` from inside HELENA to change them (see `wake_config.py`).
+That file is polled every couple seconds, so a running listener picks up new
+values without a restart. Deleting it, or a key inside it, falls back to the
+defaults in `wake_config.py`. Clap detection is inherently a blunt
 instrument — a dropped book or a door slam can trigger it. Two claps in a
 tight window cuts false positives a lot; if it's still too sensitive, raise
-THRESHOLD first, then tighten the window.
+`threshold` first, then tighten the window.
 
 Usage:
     python clap_listener.py                      # listen forever
@@ -28,16 +32,11 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
+from wake_config import ReloadingWakeConfig, format_config
+
 SAMPLE_RATE = 16_000
 BLOCK_MS = 30
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
-
-# --- tuning --------------------------------------------------------------
-THRESHOLD = 0.35          # RMS level (0-1 float audio) that counts as "loud"
-REFRACTORY_S = 0.15       # ignore new spikes for this long after one fires (avoids double-counting one clap)
-CLAP_WINDOW_S = 1.2       # both claps must land inside this window
-COOLDOWN_S = 4.0          # after a successful wake, ignore audio for this long
-# ---------------------------------------------------------------------------
 
 HERE = Path(__file__).parent
 
@@ -47,20 +46,22 @@ def rms(block: np.ndarray) -> float:
 
 
 def listen_for_double_clap(workspace: Path) -> None:
-    print(f"[wake] listening for two claps · threshold={THRESHOLD} window={CLAP_WINDOW_S}s")
+    wake_cfg = ReloadingWakeConfig()
+    print(f"[wake] listening for two claps · {format_config(wake_cfg.get())}")
     last_spike = 0.0
     first_clap_at: float | None = None
     cooldown_until = 0.0
 
     def callback(indata, frames, time_info, status):  # noqa: ANN001 - sounddevice signature
         nonlocal last_spike, first_clap_at, cooldown_until
+        cfg = wake_cfg.get()
         now = time.monotonic()
         if now < cooldown_until:
             return
         level = rms(indata[:, 0])
-        if level < THRESHOLD:
+        if level < cfg["threshold"]:
             return
-        if now - last_spike < REFRACTORY_S:
+        if now - last_spike < cfg["refractory_s"]:
             return
         last_spike = now
 
@@ -69,10 +70,10 @@ def listen_for_double_clap(workspace: Path) -> None:
             print("[wake] clap 1…")
             return
 
-        if now - first_clap_at <= CLAP_WINDOW_S:
+        if now - first_clap_at <= cfg["clap_window_s"]:
             print("[wake] clap 2 — waking HELENA")
             first_clap_at = None
-            cooldown_until = now + COOLDOWN_S
+            cooldown_until = now + cfg["cooldown_s"]
             trigger(workspace)
         else:
             # too slow — this spike becomes a fresh "clap 1" instead of being dropped

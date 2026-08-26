@@ -23,7 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
                "  helena                              start the interactive harness\n"
                "  helena 'what does agent.py do?'     start with a first message\n"
                "  helena -p 'run the tests' --mode auto   one-shot, no prompts\n"
-               "  helena -C ~/code/api --mode plan    read-only session in another directory",
+               "  helena -C ~/code/api --mode plan    read-only session in another directory\n"
+               "  helena --attach                     join a running helena-web session instead",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("prompt", nargs="*", help="Optional first message.")
@@ -47,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Fail instead of starting a local model server.")
     parser.add_argument("--max-iterations", type=int, default=None,
                         help="Cap on tool-calling steps per turn.")
+    parser.add_argument("--attach", nargs="?", const="ws://127.0.0.1:8765/ws", default=None, metavar="URL",
+                        help="Attach to a running `helena-web` session instead of starting a new one "
+                             "(default: ws://127.0.0.1:8765/ws) — mirrors that browser session in this terminal.")
     parser.add_argument("--version", action="version", version=f"helena {__version__}")
     return parser
 
@@ -134,6 +138,10 @@ def main() -> None:
 
     config = apply_overrides(Config.load(workspace), args)
     prompt = " ".join(args.prompt).strip()
+
+    if args.attach:
+        from .attach import run_attach
+        raise SystemExit(asyncio.run(run_attach(args.attach, config)))
 
     if args.one_shot:
         if not prompt and not sys.stdin.isatty():

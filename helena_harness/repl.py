@@ -73,6 +73,7 @@ COMMANDS: dict[str, str] = {
     "/barehands-setup": "Clone, start, and connect the barehands hand-tracked board",
     "/board": "Send a raw board command — /board present src=models/car.glb title=\"My Car\"",
     "/board-state": "Show what's actually on the barehands board right now",
+    "/wake-config": "Show or tune the clap listener — /wake-config set threshold 0.4",
     "/exit": "Quit (Ctrl-D also works)",
 }
 
@@ -380,6 +381,7 @@ class Repl:
             "/barehands-setup": self.cmd_barehands_setup,
             "/board": self.cmd_board,
             "/board-state": self.cmd_board_state,
+            "/wake-config": self.cmd_wake_config,
         }
         handler = handlers.get(cmd)
         if not handler:
@@ -1150,3 +1152,53 @@ here is bundled into HELENA itself.
             self.ui.error(str(exc))
             return
         self.ui.print(bh.describe_state(state))
+
+    def cmd_wake_config(self, args: list[str]) -> None:
+        """Tune the clap listener from inside HELENA instead of editing
+        clap_listener.py by hand. Writes to ~/.helena/wake.json, which a
+        running listener process polls and picks up on its own — see
+        extras/wakeup/wake_config.py for why it works that way (the listener
+        is a separate long-lived process, not part of this one)."""
+        # extras/wakeup isn't part of the installed package (see pyproject's
+        # packages.find) — it's a repo-relative folder, so it's only
+        # reachable when running from a checkout. Reached via sys.path
+        # rather than a dotted import so this doesn't require extras/ to be
+        # a formal package.
+        wakeup_dir = Path(__file__).resolve().parent.parent / "extras" / "wakeup"
+        if str(wakeup_dir) not in sys.path:
+            sys.path.insert(0, str(wakeup_dir))
+        try:
+            from wake_config import DEFAULTS, FIELDS, format_config, save_wake_config
+        except ImportError:
+            self.ui.warn(
+                f"Couldn't find wake_config.py under {wakeup_dir} — this command needs a repo checkout, "
+                "not just the installed package."
+            )
+            return
+
+        if not args or args[0] == "show":
+            self.ui.print(f"Wake listener config: [bold]{format_config()}[/bold]")
+            self.ui.notice(
+                "/wake-config set <threshold|refractory_s|clap_window_s|cooldown_s> <value> · "
+                "/wake-config reset. Takes effect on a running listener within a couple seconds — "
+                "no restart needed."
+            )
+            return
+        if args[0] == "reset":
+            save_wake_config(DEFAULTS)
+            self.ui.print(f"Reset to defaults: [bold]{format_config()}[/bold]")
+            return
+        if args[0] == "set" and len(args) == 3:
+            field, raw_value = args[1], args[2]
+            if field not in FIELDS:
+                self.ui.warn(f"Unknown field {field!r}. Valid fields: {', '.join(FIELDS)}")
+                return
+            try:
+                value = float(raw_value)
+            except ValueError:
+                self.ui.warn(f"{raw_value!r} isn't a number.")
+                return
+            save_wake_config({field: value})
+            self.ui.print(f"Set {field} = {value}. Current config: [bold]{format_config()}[/bold]")
+            return
+        self.ui.warn("Usage: /wake-config [show | set <field> <value> | reset]")

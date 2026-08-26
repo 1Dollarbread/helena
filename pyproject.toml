@@ -19,6 +19,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "prompt_toolkit>=3.0.43",
     "rich>=13.7",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,9 @@ voice = [
     "sounddevice>=0.4.6",
     "numpy>=1.24",
 ]
+push = [
+    "pywebpush>=2.0",
+]
 
 [project.scripts]
 helena = "helena_harness.__main__:main"
@@ -41,7 +45,7 @@ helena-web = "helena_harness.webui:main"
 include = ["helena_server*", "helena_harness*"]
 
 [tool.setuptools.package-data]
-helena_harness = ["web_static/*.html"]
+helena_harness = ["web_static/*.html", "web_static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
