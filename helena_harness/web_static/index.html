@@ -264,7 +264,17 @@ async function enablePush() {
   const perm = await Notification.requestPermission();
   if (perm !== 'granted') { append('notification permission denied', 'warn'); return; }
   try {
-    const reg = await navigator.serviceWorker.register('/sw.js');
+    // register() resolves as soon as registration *starts* (installing
+    // state) — subscribing against that can fail with "no active Service
+    // Worker" if it hasn't finished activating yet. `.ready` resolves only
+    // once a worker is actually active, which is what subscribe() needs.
+    await navigator.serviceWorker.register('/sw.js');
+    const reg = await navigator.serviceWorker.ready;
+    // A stale subscription from an earlier attempt (e.g. before this fix)
+    // can carry a mismatched applicationServerKey and make subscribe()
+    // throw InvalidStateError — clear it first so this always starts clean.
+    const existing = await reg.pushManager.getSubscription();
+    if (existing) { await existing.unsubscribe(); }
     const keyRes = await fetch('/push/vapid-public-key');
     if (!keyRes.ok) {
       append('push needs the server\'s push extra installed (pip install -e ".[push]")', 'warn');
