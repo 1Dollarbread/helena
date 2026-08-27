@@ -30,8 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="*", help="Optional first message.")
     parser.add_argument("-p", "--print", action="store_true", dest="one_shot",
                         help="Run one turn, print the reply, exit.")
-    parser.add_argument("-C", "--workspace", default=None,
-                        help="Directory to work in (default: the current one).")
+    parser.add_argument("-C", "--workspace", nargs="?", const=".", default=None,
+                        help="Directory to work in (default: the current one — "
+                             "so does bare -C with no path after it).")
     parser.add_argument("--model", default=None, help="Chat model, e.g. qwen2.5:7b-instruct.")
     parser.add_argument("--vision-model", default=None, help="Model used for images, e.g. llava.")
     parser.add_argument("--server", default=None, help="HELENA server URL.")
