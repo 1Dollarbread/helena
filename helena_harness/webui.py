@@ -382,7 +382,9 @@ def build_app(config: Config) -> FastAPI:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="helena-web", description="HELENA's browser-based HUD client.")
-    parser.add_argument("-C", "--workspace", default=None, help="Directory to work in.")
+    parser.add_argument("-C", "--workspace", nargs="?", const=".", default=None,
+                        help="Directory to work in (defaults to the current directory — "
+                             "so does bare -C with no path after it).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--model", default=None)
