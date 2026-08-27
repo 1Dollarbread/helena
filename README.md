@@ -31,27 +31,21 @@ LAN without the harness noticing — point `HELENA_SERVER_URL` at it.
 
 ---
 
-> **New here, or just want it running?** Read **[SETUP.md](./SETUP.md)** instead of
-> this file — one linear path, copy-paste blocks, nothing to skip around.
-> Everything below this point is reference material: what each piece does,
-> every command, every setting. Come back to it once HELENA is already running.
-
----
-
 ## Quick start
 
-Copy-paste, in order, in your regular terminal (not inside HELENA):
+Three commands, in your regular terminal (not inside HELENA):
 
 ```bash
 git clone <this repo> && cd RogerCraig
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+./setup.sh
 ```
 
-```bash
-ollama pull qwen2.5:7b-instruct   # required — a tool-calling model
-ollama pull llava                  # optional — only if you want image support
-```
+`setup.sh` creates the virtualenv, installs everything, pulls the required
+model, and — if you say yes when it asks — wires up the web HUD's push
+notifications and the wake-on-clap login item, with no manual path-editing.
+It's safe to re-run any time; it only does what isn't already done. See
+`./setup.sh --help`-style flags at the top of the script for non-interactive
+options (`--minimal`, `--everything`, `--wake`/`--no-wake`).
 
 ```bash
 ./start.sh
@@ -63,7 +57,11 @@ helena
 
 That's it — you're now at the `you ›` prompt, talking to HELENA. Everything
 below `./start.sh` and `helena` is your **daily** routine once setup is done;
-the two blocks above it only need to happen once.
+`./setup.sh` only needs to happen once (or again, any time you want to add
+something you skipped the first time).
+
+Want the browser HUD instead of the terminal? `helena-web` — no extra setup,
+it's part of the core install.
 
 When you're done for the day:
 
@@ -72,6 +70,24 @@ When you're done for the day:
 ```
 
 If `helena` doesn't start after all this, see [Troubleshooting](#troubleshooting).
+
+<details>
+<summary>What <code>setup.sh</code> is doing, if you'd rather run it by hand</summary>
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"            # core
+pip install -e ".[voice]"          # optional — wake-on-clap, spoken debriefs
+pip install -e ".[push]"           # optional — browser push notifications
+ollama pull qwen2.5:7b-instruct    # required — a tool-calling model
+ollama pull llava                   # optional — only if you want image support
+```
+
+Wake-on-clap as a login item still needs a plist copied into
+`~/Library/LaunchAgents/` with an absolute path baked in — that's the one
+piece worth letting `setup.sh --wake` do for you rather than by hand; see
+`extras/wakeup/README.md` if you want to see exactly what it does.
+</details>
 
 <details>
 <summary>Advanced: running the server yourself, instead of via <code>start.sh</code></summary>
