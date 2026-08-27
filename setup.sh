@@ -79,7 +79,11 @@ source .venv/bin/activate
 # --- 2. Install --------------------------------------------------------
 
 say "Installing HELENA (core)"
-pip install -q -e ".[dev]"
+if ! pip install -q -e ".[dev]"; then
+  echo "error: core install failed — re-run without -q to see the real error:" >&2
+  echo "       pip install -e \".[dev]\"" >&2
+  exit 1
+fi
 ok "core installed"
 
 if [ "$MINIMAL" = 1 ]; then
@@ -176,9 +180,28 @@ fi
 # --- done ------------------------------------------------------------------
 
 echo
-echo "Setup complete. From here:"
-echo "  1. ./start.sh     — start Ollama + the HELENA server"
-echo "  2. helena          — terminal agent   (or: helena-web  — browser HUD)"
-echo "  3. ./stop.sh      — shut the stack down when you're done"
+say "Verifying the install"
+if command -v helena >/dev/null 2>&1 && command -v helena-web >/dev/null 2>&1; then
+  ok "helena and helena-web commands are available"
+else
+  warn "helena/helena-web didn't register correctly even inside this script's venv."
+  warn "Try running 'pip install -e \".[dev]\"' again by hand and check for errors above it."
+fi
+
+echo
+echo "======================================================================"
+echo " IMPORTANT: this only activated the virtualenv for setup.sh itself —"
+echo " it does NOT carry over to your terminal. In THIS terminal (and any"
+echo " new tab you open later), run this once before 'helena' will work:"
+echo
+echo "     source .venv/bin/activate"
+echo
+echo "======================================================================"
+echo
+echo "Then, every time you sit down to use HELENA:"
+echo "  1. source .venv/bin/activate   (only if this tab doesn't already show (.venv))"
+echo "  2. ./start.sh                   — start Ollama + the HELENA server"
+echo "  3. helena                       — terminal agent   (or: helena-web  — browser HUD)"
+echo "  4. ./stop.sh                    — shut the stack down when you're done"
 echo
 echo "Re-run ./setup.sh any time — it only does what isn't already done."
