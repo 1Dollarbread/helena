@@ -131,7 +131,10 @@ class WriteFileTool(Tool):
     name = "write_file"
     description = """
     Create a file, or replace an existing file's entire contents.
-    Prefer edit_file for changes to an existing file — this overwrites everything.
+    Prefer edit_file for changes to an existing file — this overwrites everything,
+    so asking for "update"/"fix" something and getting this instead of edit_file
+    is how a change can look identical to before (the rewrite reproduces the
+    same content) or silently drops something the rewrite forgot to include.
     Parent directories are created as needed.
     """
     action = Action.WRITE
@@ -193,6 +196,13 @@ class CreateProjectTool(Tool):
     the user asked you to build, with no matching write_file/create_project call
     behind it, has not created anything — the user would have to copy-paste it
     themselves, which defeats the entire point of having tools.
+
+    NOT for updating a project that already exists — rewriting a file's full
+    contents to change one part of it is how "update the server" turns into
+    nothing actually changing (the model re-derives the same file from scratch
+    and gets the same result), or silently drops something the rewrite forgot
+    to include. For an existing file, read it and use edit_file for the
+    specific part that needs to change instead.
 
     Give it a list of {path, content} pairs; every path is created (parent
     directories included) relative to the workspace, or `cwd` if given. After
