@@ -400,6 +400,13 @@ class Repl:
             "\n[dim]Anything else is a message to HELENA. Paste an image path in a message "
             "to have it looked at. Ctrl-C interrupts a running turn; Ctrl-D exits.[/dim]"
         )
+        self.ui.print(
+            "\n[dim]Web HUD & multi-client: `helena-web` opens a browser HUD; `helena --attach` "
+            "joins that same live session from a terminal — same conversation, either side can "
+            "type. The web HUD also has a session-history sidebar and can push a browser "
+            "notification when a turn finishes while the tab isn't focused (click the bell icon "
+            "once to enable it).[/dim]"
+        )
 
     async def cmd_model(self, args: list[str]) -> None:
         if not args:
