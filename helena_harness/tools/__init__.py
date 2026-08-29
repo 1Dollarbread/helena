@@ -25,6 +25,7 @@ from .files import (
     TodoWriteTool,
     WriteFileTool,
 )
+from .print3d import GenerateModelTool, SendToPrinterTool, SliceModelTool
 from .shell import CheckJobTool, DevServerTool, RunCommandTool
 from .vision import AnalyzeImageTool
 from .web import FetchUrlTool, WebSearchTool
@@ -38,6 +39,9 @@ if TYPE_CHECKING:  # pragma: no cover
 # user" tools rather than filesystem/execution ones — they simply no-op with a
 # clear "not set up, run /barehands-setup" error if barehands isn't configured,
 # same pattern as voice.check_available(), so it's safe to always register them.
+# The print3d tools follow the same pattern: always registered, each one
+# raising a clear "not configured, see the README" error until its own prereqs
+# (openscad / slicer path+profiles / bambu_ip+access_code+serial) are set.
 TOOL_CLASSES: list[type[Tool]] = [
     ReadFileTool,
     ListDirTool,
@@ -65,6 +69,9 @@ TOOL_CLASSES: list[type[Tool]] = [
     RemindTool,
     RememberTool,
     TimeTool,
+    GenerateModelTool,
+    SliceModelTool,
+    SendToPrinterTool,
 ]
 
 

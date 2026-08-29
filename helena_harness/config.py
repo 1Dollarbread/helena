@@ -91,6 +91,21 @@ class Config:
     barehands_path: str = ""
     barehands_port: int = 8794
 
+    # 3D printing — optional, off by default. generate_3d_model needs only
+    # OpenSCAD on PATH. slice_model and send_to_printer need the rest of
+    # these filled in once; see extras/print3d/README.md for the full setup
+    # (OpenSCAD, a slicer CLI, a Bambu A1 profile bundle, and switching the
+    # printer to LAN-only + Developer Mode). Empty bambu_ip means "not set up"
+    # — send_to_printer refuses with setup instructions rather than guessing.
+    print3d_openscad_path: str = "openscad"
+    print3d_slicer_path: str = ""              # path to the OrcaSlicer/Bambu Studio CLI binary
+    print3d_slicer_profile_dir: str = ""       # dir holding printer.json / filament.json / process.json
+    print3d_output_dir: str = ""               # empty means <workspace>/print3d
+    bambu_ip: str = ""
+    bambu_access_code: str = ""                # shown on the printer's screen in LAN-only mode
+    bambu_serial: str = ""
+    bambu_lan_only: bool = True                # printer must be in LAN-only + Developer Mode
+
     # Populated at load time; not written back to disk.
     workspace: Path = field(default_factory=Path.cwd)
 
@@ -115,6 +130,10 @@ class Config:
     @property
     def barehands_url(self) -> str:
         return f"http://127.0.0.1:{self.barehands_port}"
+
+    @property
+    def print3d_dir(self) -> Path:
+        return Path(self.print3d_output_dir) if self.print3d_output_dir else (self.workspace / "print3d")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -163,6 +182,13 @@ class Config:
             "HELENA_MODE": "mode",
             "HELENA_ELEVENLABS_VOICE_ID": "elevenlabs_voice_id",
             "HELENA_BAREHANDS_PATH": "barehands_path",
+            "HELENA_OPENSCAD_PATH": "print3d_openscad_path",
+            "HELENA_SLICER_PATH": "print3d_slicer_path",
+            "HELENA_SLICER_PROFILE_DIR": "print3d_slicer_profile_dir",
+            "HELENA_PRINT3D_OUTPUT_DIR": "print3d_output_dir",
+            "HELENA_BAMBU_IP": "bambu_ip",
+            "HELENA_BAMBU_ACCESS_CODE": "bambu_access_code",
+            "HELENA_BAMBU_SERIAL": "bambu_serial",
         }
         for env_key, attr in env_map.items():
             val = os.environ.get(env_key)
@@ -190,6 +216,7 @@ class Config:
             ("HELENA_ALLOW_OUTSIDE_WORKSPACE", "allow_outside_workspace"),
             ("HELENA_SPEAK_REPLIES", "speak_replies"),
             ("HELENA_MEMORY_ENABLED", "memory_enabled"),
+            ("HELENA_BAMBU_LAN_ONLY", "bambu_lan_only"),
         ):
             val = os.environ.get(env_key)
             if val is not None:

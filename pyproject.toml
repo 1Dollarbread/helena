@@ -35,6 +35,9 @@ voice = [
 push = [
     "pywebpush>=2.0",
 ]
+print3d = [
+    "paho-mqtt>=1.6",
+]
 
 [project.scripts]
 helena = "helena_harness.__main__:main"
