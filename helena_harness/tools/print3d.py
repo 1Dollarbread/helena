@@ -13,7 +13,8 @@ Three tools, one per stage, so each can be inspected/retried on its own:
                          OrcaSlicer or Bambu Studio CLI binary, using a
                          profile bundle exported once from that slicer's GUI.
     send_to_printer     Pushes the sliced file to a Bambu Lab A1 over the LAN
-                         (FTPS) and starts the print over MQTT. Requires the
+                         and starts the print, via the community `bambulabs-api`
+                         library (FTPS upload + MQTT print-start). Requires the
                          printer in LAN-only + Developer Mode — see
                          extras/print3d/README.md. This one always asks for
                          confirmation regardless of permission mode, since it
@@ -28,10 +29,7 @@ see the README for specifics.
 from __future__ import annotations
 
 import asyncio
-import ftplib
-import json
 import re
-import ssl
 import time
 import uuid
 from pathlib import Path
@@ -250,162 +248,49 @@ class SliceModelTool(Tool):
 # --- stage 3: push to the A1 over LAN and start ------------------------------
 
 
-class ImplicitFTP_TLS(ftplib.FTP_TLS):
-    """FTP_TLS that wraps the data socket in SSL automatically.
-
-    Bambu's onboard FTP server uses *implicit* FTPS (TLS from the first byte,
-    port 990) rather than the more common explicit/STARTTLS FTPS that
-    ftplib.FTP_TLS assumes — this is the standard workaround.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._sock = None
-
-    @property
-    def sock(self):
-        return self._sock
-
-    @sock.setter
-    def sock(self, value):
-        if value is not None and not isinstance(value, ssl.SSLSocket):
-            value = self.context.wrap_socket(value)
-        self._sock = value
-
-    def ntransfercmd(self, cmd, rest=None):
-        # The base FTP_TLS.ntransfercmd() wraps the *data* connection (used
-        # for the actual file upload) in TLS by passing
-        # server_hostname=self.host — but self.host here is an IP address,
-        # and IP literals aren't valid SNI values (RFC 6066 explicitly
-        # disallows them). Well-behaved TLS stacks ignore an invalid SNI;
-        # some small embedded ones (routers, printers, this kind of thing)
-        # don't — they just stall the handshake instead of erroring, which
-        # shows up here as a plain read timeout during upload with no other
-        # clue. We've already disabled hostname/cert verification on this
-        # context, so nothing downstream actually needs SNI to begin with —
-        # wrapping without it sidesteps the whole problem.
-        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
-        if self._prot_p:
-            conn = self.context.wrap_socket(conn, session=self.sock.session)
-        return conn, size
-
-
-def _upload_via_ftps(cfg, local_path: Path, remote_name: str) -> None:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # printer uses a self-signed cert on the LAN
-    ftp = ImplicitFTP_TLS(context=ctx)
-
-    # Each stage gets its own error message so a failure here points
-    # straight at what actually broke (auth vs. the data channel vs. the
-    # transfer itself) instead of one blanket "upload failed" that could
-    # mean any of several very different problems.
+def _send_via_bambulabs_api(
+    cfg, local_path: Path, remote_name: str, *, plate: int, use_ams: bool, flow_cali: bool
+) -> None:
     try:
-        ftp.connect(host=cfg.bambu_ip, port=990, timeout=25)
-    except OSError as exc:
-        raise ToolError(
-            f"Couldn't open the control connection to {cfg.bambu_ip}:990 ({exc})."
-        ) from exc
-
-    try:
-        ftp.login(user="bblp", passwd=cfg.bambu_access_code)
-    except ftplib.all_errors as exc:
-        raise ToolError(
-            f"Login to the printer failed ({exc}) — check bambu_access_code "
-            "matches what's currently shown on the printer's screen right now "
-            "(it changes if you refresh it)."
-        ) from exc
-
-    try:
-        ftp.prot_p()
-    except ftplib.all_errors as exc:
-        raise ToolError(f"Couldn't secure the data channel ({exc}).") from exc
-
-    # Passive mode (the default) has the printer tell us where to connect
-    # for the actual file bytes — some embedded FTP servers misreport their
-    # own address here (wrong interface, an internal-only IP, etc.), which
-    # produces exactly a stall-then-timeout on the transfer step with the
-    # control connection, login, and TLS all having worked fine. Active
-    # mode flips that: we tell the printer exactly where to connect back to
-    # us instead, which sidesteps a misreporting server entirely. Since
-    # this is always same-LAN traffic (never through a NAT/router hairpin),
-    # active mode has no real downside here.
-    ftp.set_pasv(False)
-
-    try:
-        with local_path.open("rb") as fh:
-            ftp.storbinary(f"STOR {remote_name}", fh)
-    except ftplib.all_errors as exc:
-        raise ToolError(
-            f"File upload failed during the data transfer itself ({exc}). If this is a new "
-            "failure after working before, macOS may be blocking the inbound connection the "
-            "printer makes back to this Mac in active mode — check for a firewall permission "
-            "prompt, or System Settings → Network → Firewall."
-        ) from exc
-
-    ftp.quit()
-
-
-def _mqtt_start_print(cfg, remote_name: str, *, plate: int, bed_leveling: bool, flow_cali: bool, use_ams: bool) -> None:
-    try:
-        import paho.mqtt.client as mqtt
+        import bambulabs_api as bl
     except ImportError as exc:
         raise ToolError(
-            "paho-mqtt is not installed. Run: pip install -e \".[print3d]\""
+            "bambulabs-api is not installed. Run: pip install -e \".[print3d]\""
         ) from exc
 
-    payload = {
-        "print": {
-            "sequence_id": "0",
-            "command": "project_file",
-            "param": f"Metadata/plate_{plate}.gcode",
-            "project_id": "0",
-            "profile_id": "0",
-            "task_id": "0",
-            "subtask_id": "0",
-            "subtask_name": "",
-            "file": remote_name,
-            "url": f"file:///sdcard/{remote_name}",
-            "md5": "",
-            "timelapse": False,
-            "bed_type": "auto",
-            "bed_leveling": bed_leveling,
-            "flow_cali": flow_cali,
-            "vibration_cali": True,
-            "layer_inspect": False,
-            "ams_mapping": [],
-            "use_ams": use_ams,
-        }
-    }
+    # This community library (github.com/BambuTools/bambulabs_api) already
+    # handles the implicit-FTPS quirks (TLS SNI on the data channel, passive
+    # vs. active mode, and whatever else varies across firmware versions)
+    # that a hand-rolled ftplib client kept tripping over — it's used
+    # against real A1/A1-mini/P1/X1 hardware by a fairly large user base, so
+    # it's a better bet than continuing to debug our own implementation
+    # blind against hardware we can't directly test.
+    printer = bl.Printer(cfg.bambu_ip, cfg.bambu_access_code, cfg.bambu_serial)
+    try:
+        printer.connect()
+        time.sleep(2)  # give the MQTT/FTP clients a moment to actually establish
 
-    result: dict[str, Any] = {"published": False, "error": None}
+        try:
+            with local_path.open("rb") as fh:
+                printer.upload_file(fh, remote_name)
+        except Exception as exc:  # noqa: BLE001 - surface whatever the library raises plainly
+            raise ToolError(
+                f"Upload to {cfg.bambu_ip} failed ({exc}). Confirm bambu_access_code matches "
+                "what's currently shown on the printer's screen right now, and that LAN-only + "
+                "Developer Mode are both on."
+            ) from exc
 
-    def on_connect(client, userdata, flags, rc, properties=None):
-        if rc != 0:
-            result["error"] = f"MQTT connect failed (rc={rc}) — check bambu_access_code."
-            client.disconnect()
-            return
-        topic = f"device/{cfg.bambu_serial}/request"
-        client.publish(topic, json.dumps(payload), qos=1)
-        result["published"] = True
-        client.disconnect()
-
-    client = mqtt.Client()
-    client.username_pw_set("bblp", cfg.bambu_access_code)
-    client.tls_set(cert_reqs=ssl.CERT_NONE)
-    client.tls_insecure_set(True)  # self-signed cert on the LAN
-    client.on_connect = on_connect
-    client.connect(cfg.bambu_ip, 8883, keepalive=15)
-    client.loop_start()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not result["published"] and not result["error"]:
-        time.sleep(0.1)
-    client.loop_stop()
-
-    if result["error"]:
-        raise ToolError(result["error"])
-    if not result["published"]:
-        raise ToolError("Timed out waiting to publish the print-start command over MQTT.")
+        started = printer.start_print(
+            filename=remote_name,
+            plate_number=plate,
+            use_ams=use_ams,
+            ams_mapping=[0],
+            flow_calibration=flow_cali,
+        )
+        if not started:
+            raise ToolError("The printer rejected the print-start command.")
+    finally:
+        printer.disconnect()
 
 
 class SendToPrinterTool(Tool):
@@ -430,8 +315,7 @@ class SendToPrinterTool(Tool):
         "properties": {
             "file_path": {"type": "string", "description": "Path to the sliced .3mf, e.g. from slice_model's output."},
             "plate": {"type": "integer", "description": "Plate number to print. Default 1."},
-            "bed_leveling": {"type": "boolean", "description": "Run bed leveling before printing. Default true."},
-            "flow_calibration": {"type": "boolean", "description": "Run flow calibration before printing. Default false."},
+            "flow_calibration": {"type": "boolean", "description": "Run automatic flow calibration before printing. Default true."},
             "use_ams": {"type": "boolean", "description": "True if this print uses an AMS filament unit. Default false — the A1 ships without one."},
         },
         "required": ["file_path"],
@@ -469,32 +353,19 @@ class SendToPrinterTool(Tool):
 
         file_path = resolve_path(ctx, args.get("file_path") or "", must_exist=True)
         plate = int(args.get("plate") or 1)
-        bed_leveling = args.get("bed_leveling", True)
-        flow_cali = bool(args.get("flow_calibration", False))
+        flow_cali = bool(args.get("flow_calibration", True))
         use_ams = bool(args.get("use_ams", False))
         remote_name = file_path.name
 
-        # _upload_via_ftps already raises a stage-labeled ToolError on
-        # failure; just let that through as-is rather than re-wrapping it in
-        # a second, vaguer message. The bare except is a last-resort net for
-        # anything genuinely unexpected slipping past ftplib's own error
-        # hierarchy.
-        try:
-            await asyncio.to_thread(_upload_via_ftps, cfg, file_path, remote_name)
-        except ToolError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise ToolError(f"FTPS upload to {cfg.bambu_ip} failed unexpectedly: {exc}") from exc
-
         try:
             await asyncio.to_thread(
-                _mqtt_start_print, cfg, remote_name,
-                plate=plate, bed_leveling=bool(bed_leveling), flow_cali=flow_cali, use_ams=use_ams,
+                _send_via_bambulabs_api, cfg, file_path, remote_name,
+                plate=plate, use_ams=use_ams, flow_cali=flow_cali,
             )
         except ToolError:
             raise
-        except Exception as exc:  # noqa: BLE001 - surface any transport failure plainly
-            raise ToolError(f"MQTT print-start failed: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"Sending to the printer failed unexpectedly: {exc}") from exc
 
         return ToolResult(
             ok=True,
