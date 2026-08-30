@@ -141,13 +141,17 @@ class SliceModelTool(Tool):
     for the Bambu A1 (printer/filament/process presets).
 
     Needs print3d_slicer_path (the CLI binary) and print3d_slicer_profile_dir
-    (a folder holding printer.json, filament.json, process.json — exported
-    once from the slicer's GUI: Print/Filament/Printer settings tabs → the
-    save icon) configured. Raises with setup instructions if they aren't.
+    (a folder holding printer.json, filament.json, process.json — pulled from
+    the slicer's own settings folder, e.g. ~/Library/Application
+    Support/OrcaSlicer/user/default/{machine,process,filament}/) configured.
+    Raises with setup instructions if they aren't.
 
-    Slicer CLI flags shift between versions, so if this fails, the raw
-    stdout/stderr is returned — read it, and adjust extra_args or the
-    profile dir rather than assuming the pipeline is broken.
+    Slicer CLI flags shift between versions, and older/newer config files can
+    trip an "unknown config type" error even when the files are valid — this
+    always passes --allow-newer-file to work around that known OrcaSlicer CLI
+    quirk. If slicing still fails, the raw stdout/stderr is returned — read
+    it, and adjust extra_args or the profile dir rather than assuming the
+    pipeline is broken.
     """
     action = Action.EXECUTE
     read_only = False
@@ -191,12 +195,17 @@ class SliceModelTool(Tool):
 
         # OrcaSlicer / Bambu Studio CLI syntax as of writing. `--slice 0`
         # slices all plates, `--export-3mf` writes a ready-to-print 3MF
-        # (embedded gcode) rather than a bare .gcode. If your installed
-        # version renamed these flags, pass extra_args or run
-        # `<slicer> --help` and adjust here.
+        # (embedded gcode) rather than a bare .gcode. `--allow-newer-file`
+        # works around a known OrcaSlicer CLI bug (upstream issues #8155,
+        # #4199) where perfectly valid printer/process/filament JSON — even
+        # exported straight from the app's own settings folder — gets
+        # rejected with "unknown config type of file ... in load-settings".
+        # If your installed version renamed these flags, pass extra_args or
+        # run `<slicer> --help` and adjust here.
         cmd = [
             cfg.print3d_slicer_path,
             "--slice", "0",
+            "--allow-newer-file",
             "--load-settings", f"{profiles['printer']};{profiles['process']}",
             "--load-filaments", str(profiles["filament"]),
             "--export-3mf", str(out_dir / f"{stl_path.stem}.3mf"),
