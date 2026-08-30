@@ -321,11 +321,27 @@ def _upload_via_ftps(cfg, local_path: Path, remote_name: str) -> None:
     except ftplib.all_errors as exc:
         raise ToolError(f"Couldn't secure the data channel ({exc}).") from exc
 
+    # Passive mode (the default) has the printer tell us where to connect
+    # for the actual file bytes — some embedded FTP servers misreport their
+    # own address here (wrong interface, an internal-only IP, etc.), which
+    # produces exactly a stall-then-timeout on the transfer step with the
+    # control connection, login, and TLS all having worked fine. Active
+    # mode flips that: we tell the printer exactly where to connect back to
+    # us instead, which sidesteps a misreporting server entirely. Since
+    # this is always same-LAN traffic (never through a NAT/router hairpin),
+    # active mode has no real downside here.
+    ftp.set_pasv(False)
+
     try:
         with local_path.open("rb") as fh:
             ftp.storbinary(f"STOR {remote_name}", fh)
     except ftplib.all_errors as exc:
-        raise ToolError(f"File upload failed during the data transfer itself ({exc}).") from exc
+        raise ToolError(
+            f"File upload failed during the data transfer itself ({exc}). If this is a new "
+            "failure after working before, macOS may be blocking the inbound connection the "
+            "printer makes back to this Mac in active mode — check for a firewall permission "
+            "prompt, or System Settings → Network → Firewall."
+        ) from exc
 
     ftp.quit()
 
