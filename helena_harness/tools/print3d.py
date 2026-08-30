@@ -272,17 +272,61 @@ class ImplicitFTP_TLS(ftplib.FTP_TLS):
             value = self.context.wrap_socket(value)
         self._sock = value
 
+    def ntransfercmd(self, cmd, rest=None):
+        # The base FTP_TLS.ntransfercmd() wraps the *data* connection (used
+        # for the actual file upload) in TLS by passing
+        # server_hostname=self.host — but self.host here is an IP address,
+        # and IP literals aren't valid SNI values (RFC 6066 explicitly
+        # disallows them). Well-behaved TLS stacks ignore an invalid SNI;
+        # some small embedded ones (routers, printers, this kind of thing)
+        # don't — they just stall the handshake instead of erroring, which
+        # shows up here as a plain read timeout during upload with no other
+        # clue. We've already disabled hostname/cert verification on this
+        # context, so nothing downstream actually needs SNI to begin with —
+        # wrapping without it sidesteps the whole problem.
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn, session=self.sock.session)
+        return conn, size
+
 
 def _upload_via_ftps(cfg, local_path: Path, remote_name: str) -> None:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # printer uses a self-signed cert on the LAN
     ftp = ImplicitFTP_TLS(context=ctx)
-    ftp.connect(host=cfg.bambu_ip, port=990, timeout=20)
-    ftp.login(user="bblp", passwd=cfg.bambu_access_code)
-    ftp.prot_p()
-    with local_path.open("rb") as fh:
-        ftp.storbinary(f"STOR {remote_name}", fh)
+
+    # Each stage gets its own error message so a failure here points
+    # straight at what actually broke (auth vs. the data channel vs. the
+    # transfer itself) instead of one blanket "upload failed" that could
+    # mean any of several very different problems.
+    try:
+        ftp.connect(host=cfg.bambu_ip, port=990, timeout=25)
+    except OSError as exc:
+        raise ToolError(
+            f"Couldn't open the control connection to {cfg.bambu_ip}:990 ({exc})."
+        ) from exc
+
+    try:
+        ftp.login(user="bblp", passwd=cfg.bambu_access_code)
+    except ftplib.all_errors as exc:
+        raise ToolError(
+            f"Login to the printer failed ({exc}) — check bambu_access_code "
+            "matches what's currently shown on the printer's screen right now "
+            "(it changes if you refresh it)."
+        ) from exc
+
+    try:
+        ftp.prot_p()
+    except ftplib.all_errors as exc:
+        raise ToolError(f"Couldn't secure the data channel ({exc}).") from exc
+
+    try:
+        with local_path.open("rb") as fh:
+            ftp.storbinary(f"STOR {remote_name}", fh)
+    except ftplib.all_errors as exc:
+        raise ToolError(f"File upload failed during the data transfer itself ({exc}).") from exc
+
     ftp.quit()
 
 
@@ -414,14 +458,17 @@ class SendToPrinterTool(Tool):
         use_ams = bool(args.get("use_ams", False))
         remote_name = file_path.name
 
+        # _upload_via_ftps already raises a stage-labeled ToolError on
+        # failure; just let that through as-is rather than re-wrapping it in
+        # a second, vaguer message. The bare except is a last-resort net for
+        # anything genuinely unexpected slipping past ftplib's own error
+        # hierarchy.
         try:
             await asyncio.to_thread(_upload_via_ftps, cfg, file_path, remote_name)
-        except ftplib.all_errors as exc:
-            raise ToolError(
-                f"FTPS upload to {cfg.bambu_ip} failed: {exc}. Confirm the printer is on the same "
-                "LAN, LAN-only + Developer Mode is on, and bambu_access_code matches the code on "
-                "its screen."
-            ) from exc
+        except ToolError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"FTPS upload to {cfg.bambu_ip} failed unexpectedly: {exc}") from exc
 
         try:
             await asyncio.to_thread(
