@@ -59,6 +59,11 @@ class ToolContext:
     jobs: dict[str, BackgroundJob] = field(default_factory=dict)
     attached_images: list[str] = field(default_factory=list)
     tool_calls_made: int = 0
+    # Unified diffs recorded by write_file/edit_file/multi_edit/create_project
+    # THIS turn (cleared at the start of Agent.send — see agent.py). This is
+    # what self_review reads: the ground truth of what actually changed, not
+    # the model's own account of what it changed.
+    turn_diffs: list[str] = field(default_factory=list)
 
     def child(self, agent_name: str) -> "ToolContext":
         """A context for a subagent: same world, deeper nesting."""
@@ -73,6 +78,7 @@ class ToolContext:
             read_files=self.read_files,   # shared: a subagent's read counts
             todos=self.todos,
             jobs=self.jobs,
+            turn_diffs=self.turn_diffs,   # shared: a subagent's edits count toward review too
         )
 
 
@@ -179,6 +185,7 @@ SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
     ".next", ".nuxt", "target", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".idea", ".vscode", "vendor", ".terraform", "coverage", ".tox", ".gradle",
+    ".helena",   # harness's own settings/sessions/logs/codebase index — never worth indexing or listing
 }
 
 
