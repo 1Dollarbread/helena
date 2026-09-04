@@ -19,8 +19,9 @@ from datetime import datetime
 from typing import Any, Sequence
 
 from . import barehands_client as bh
+from . import schema_guard
 from .client import ServerError
-from .permissions import Decision, PermissionRequest
+from .permissions import Action, Decision, PermissionRequest
 from .tools.base import Tool, ToolContext, ToolError, ToolResult, truncate
 
 SYSTEM_PROMPT = """You are {name}, a local-first AI agent that runs entirely on the user's own machine — usually from a terminal, sometimes through a browser HUD, sometimes both at once. You run entirely on locally-hosted models — nothing the user says leaves their computer.
@@ -31,13 +32,14 @@ Your character: sharp, direct, warm without being chatty. You are a capable coll
 
 You have real tools. When a request genuinely calls for one, use it — do not describe what you would do, and never claim you did something you did not actually do through a tool call. The user sees every tool you run, so inventing an action is both wrong and obvious. The reverse matters just as much: plenty of requests need no tool at all — general knowledge, opinions, explaining a concept, simple facts you already know (capitals, common conversions, well-known history) — and calling one anyway just to look busy is its own kind of noise. Answer those directly. Reach for a tool when the honest answer requires doing something real: reading a file that exists, checking a live price, running a command, searching for something you don't actually know.
 
-- Investigate before you change anything. Read the file before editing it; search before assuming a symbol exists.
+- Investigate before you change anything. Read the file before editing it; search before assuming a symbol exists. search_text is exact-string/regex; search_codebase is semantic — reach for it when you know roughly what something does but not what it's called or where it lives.
 - Prefer the specific tool over a shell command: read_file over cat, search_text over grep, find_files over find, edit_file over sed.
-- Prefer editing over recreating. If a file already exists and the request is "update", "fix", or "change" something in it, use edit_file (or a small number of targeted edit_file calls) rather than write_file/create_project on the same path — rewriting a whole file from scratch when only part of it needed to change is how a "fix" turns into a no-op that looks identical to what was already there, or silently drops unrelated parts of the file the user didn't ask you to touch. Reach for write_file/create_project when the file doesn't exist yet or is being deliberately replaced wholesale, not as a default way to apply a change.
+- Prefer editing over recreating. If a file already exists and the request is "update", "fix", or "change" something in it, use edit_file (or multi_edit when you already know several spots that need to change at once) rather than write_file/create_project on the same path — rewriting a whole file from scratch when only part of it needed to change is how a "fix" turns into a no-op that looks identical to what was already there, or silently drops unrelated parts of the file the user didn't ask you to touch. multi_edit applies a whole batch of hunks as one atomic operation — all of them or none — which is safer than several separate edit_file calls when a hunk might shift where a later one needs to match. Reach for write_file/create_project when the file doesn't exist yet or is being deliberately replaced wholesale, not as a default way to apply a change.
 - If you changed a file that a dev server (started with run_dev_server or run_command background: true) is currently serving, and the framework doesn't auto-reload, restart that job (check_job to find it, then re-run the start command) so the change actually takes effect — otherwise the user is looking at stale output and correctly concludes nothing happened, even though the file changed on disk.
 - A fenced code block in your reply is not a deliverable — it's something the user has to copy out by hand, which defeats the entire point of having file tools. If you're producing a real file the project needs (not a short snippet answering a question about how something works), write it for real. For a full-stack app or any multi-file project: plan the file tree with todo_write, then create every file — package.json, every source file, config, all of it — in one create_project call rather than one write_file call per file; a single call is both faster and far less likely to leave something half-scaffolded than remembering to call write_file N separate times. Never respond to "build me X" with a wall of code blocks and instructions to paste them in.
 - For starting a local dev server (a JS/Python project, a demo, "run this on a port"), use run_dev_server — it detects the right start command and reports the actual URL, instead of you guessing a port. After scaffolding something runnable, actually start it with run_dev_server and give the user the real working URL — don't just describe the commands they'd need to run themselves. For any other long-running background process, use run_command with background: true, then check_job to see its output. spawn_agent is a different thing entirely: delegating a self-contained task to a separate conversation, not a way to keep a process alive — and when work genuinely splits into independent parts (a frontend and a backend, several unrelated modules), issue those spawn_agent calls together in the same turn rather than one after another; independent subagents run concurrently, which matters a lot for something like a full-stack scaffold. Only split work this way when the parts don't depend on each other finishing first.
-- After changing code, verify it: run the tests, the linter, or the program itself.
+- After changing code, verify it: call run_verification (it auto-detects the project's tests/linter and actually runs them) or run the tests/program yourself. If you changed files and don't verify before you'd otherwise finish, you'll be prompted to do exactly that before the turn ends — better to do it upfront than wait for the nudge.
+- For anything non-trivial you can't verify by running (a logic change the tests don't cover, a partial refactor), call self_review before declaring it finished — it critiques the actual diffs you made against what was asked, which catches things a same-model "looks right to me" glance won't.
 - Work in small, checkable steps. For anything with more than about three steps, keep todo_write updated so the user can see where you are.
 - If a tool fails, read the error and adapt. Do not repeat the identical call and hope — if the exact same call fails twice in a row, that is a signal to change something (the arguments, the approach, or ask the user), not to try again unchanged.
 - If the user's request is ambiguous in a way that changes what you would build, ask. Otherwise make the sensible call and say what you assumed.
@@ -144,6 +146,12 @@ class Agent:
     # times before a turn is done, and the user's question doesn't change
     # mid-turn). See `recall_memory`.
     _memory_block: str = field(default="", repr=False)
+    # The other half of plan -> act -> verify: whether this turn wrote any
+    # files, and whether something actually verified the result before the
+    # turn ended. Reset at the start of every `send()`. See the auto-verify
+    # nudge at the end of `send()` below.
+    _wrote_this_turn: bool = field(default=False, repr=False)
+    _verified_this_turn: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         self._by_name = {t.name: t for t in self.tools}
@@ -284,7 +292,53 @@ class Agent:
             message["images"] = images
         self.messages.append(message)
         self._memory_block = await self.recall_memory(user_text)
-        return await self._run_loop()
+
+        # Fresh per-turn tracking for the plan -> act -> verify enforcement
+        # below, and for self_review's ground truth of what actually changed.
+        self.ctx.turn_diffs.clear()
+        self._wrote_this_turn = False
+        self._verified_this_turn = False
+
+        result = await self._run_loop()
+
+        # The concrete "verify" step: if changes were made this turn and
+        # nothing verified them before the model considered itself done,
+        # force exactly one more pass asking for that — instead of trusting
+        # a small local model to have followed the system prompt's "after
+        # changing code, verify it" unprompted. This reuses the same loop
+        # (so the model can read real test output and fix a real failure,
+        # not just acknowledge the nudge), and fires at most once per turn:
+        # if it writes again without re-verifying on this second pass, that's
+        # left alone rather than nudging indefinitely.
+        if (
+            self.ctx.config.auto_verify
+            and result.stopped == "complete"
+            and self._wrote_this_turn
+            and not self._verified_this_turn
+            and "run_verification" in self._by_name
+        ):
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "Before finishing: you changed files this turn but nothing verified the "
+                    "change. Call run_verification now (or run the project's actual test/lint "
+                    "commands yourself if run_verification finds nothing to run), then give "
+                    "your final answer reflecting the real result."
+                ),
+            })
+            follow_up = await self._run_loop()
+            # Merge rather than replace: the user-visible totals should cover
+            # the whole turn, including this forced pass.
+            result.text = follow_up.text or result.text
+            result.tool_calls += follow_up.tool_calls
+            result.iterations += follow_up.iterations
+            result.prompt_tokens += follow_up.prompt_tokens
+            result.completion_tokens += follow_up.completion_tokens
+            result.seconds += follow_up.seconds
+            result.stopped = follow_up.stopped
+            result.error = follow_up.error or result.error
+
+        return result
 
     async def _run_loop(self) -> TurnResult:
         result = TurnResult()
@@ -496,10 +550,16 @@ class Agent:
         be a declared property — an unrecognized key (like `cmd` on a tool
         that has no such parameter) is exactly the signature of a model
         inventing plausible-looking arguments rather than using a real one.
+
+        This is a coarse presence/shape check used only to pick which
+        inline-recovered candidate to prefer (see _inline_tool_calls above).
+        The real gate before anything actually runs is schema_guard's full
+        validate_args, applied uniformly to every call — native or
+        recovered — in _execute_call below.
         """
         schema = tool.parameters or {}
         required = schema.get("required") or []
-        if not all(field in args for field in required):
+        if not all(field_name in args for field_name in required):
             return False
         properties = schema.get("properties")
         if properties and not set(args).issubset(properties):
@@ -592,6 +652,17 @@ class Agent:
                 f"Error: no tool named {name!r}. Available tools: {known}.",
             )
 
+        # Full schema validation — every call, native or inline-recovered,
+        # goes through this before anything actually runs. See schema_guard.py.
+        problems = schema_guard.validate_args(tool, args)
+        if problems:
+            self.ctx.ui.warn(f"(rejected a malformed {name} call — bounced back for correction)")
+            return self._tool_message(
+                call, name,
+                f"Error: that call to {name} has invalid arguments:\n- " + "\n- ".join(problems)
+                + f"\nCall {name} again with corrected arguments — as a real tool call, not text.",
+            )
+
         try:
             preview = tool.preview(args)
         except Exception:
@@ -663,6 +734,18 @@ class Agent:
         # reasoning as clearing the denial streak above.
         for error_key in [k for k in self._error_counts if k[0] == name and k[1] == key]:
             self._error_counts.pop(error_key, None)
+
+        # Plan -> act -> verify bookkeeping for the auto-verify nudge in
+        # send(), and ground truth for self_review — both keyed off what
+        # actually ran and actually succeeded, never off what the model says.
+        if result.ok:
+            if result.meta.get("diff"):
+                self.ctx.turn_diffs.append(result.meta["diff"])
+            if name == "run_verification":
+                self._verified_this_turn = True
+            elif tool.action is Action.WRITE:
+                self._wrote_this_turn = True
+
         self._render_result(tool, result)
         content = truncate(result.content, self.ctx.config.max_tool_output_chars, "tool output")
         return self._tool_message(call, name, content)
