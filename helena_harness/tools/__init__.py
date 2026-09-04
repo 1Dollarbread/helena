@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from .agent import SpawnAgentTool
 from .base import Tool, ToolContext, ToolError, ToolResult
 from .board import BoardCommandTool, BoardStateTool, BoardStageMediaTool
+from .codesearch import SearchCodebaseTool
 from .desktop import CloseAppTool, OpenAppTool
 from .extras import RememberTool, RemindTool, StockTool, TimeTool, WeatherTool
 from .files import (
@@ -25,7 +26,9 @@ from .files import (
     TodoWriteTool,
     WriteFileTool,
 )
+from .patch import MultiEditTool
 from .shell import CheckJobTool, DevServerTool, RunCommandTool
+from .verify import RunVerificationTool, SelfReviewTool
 from .vision import AnalyzeImageTool
 from .web import FetchUrlTool, WebSearchTool
 
@@ -43,11 +46,14 @@ TOOL_CLASSES: list[type[Tool]] = [
     ListDirTool,
     FindFilesTool,
     SearchTextTool,
+    SearchCodebaseTool,
     EditFileTool,
+    MultiEditTool,
     WriteFileTool,
     CreateProjectTool,
     DeletePathTool,
     RunCommandTool,
+    RunVerificationTool,
     DevServerTool,
     CheckJobTool,
     WebSearchTool,
@@ -57,6 +63,7 @@ TOOL_CLASSES: list[type[Tool]] = [
     BoardCommandTool,
     BoardStageMediaTool,
     TodoWriteTool,
+    SelfReviewTool,
     SpawnAgentTool,
     OpenAppTool,
     CloseAppTool,
