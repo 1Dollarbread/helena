@@ -16,10 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-READ_TOOLS = ["read_file", "list_dir", "find_files", "search_text"]
+READ_TOOLS = ["read_file", "list_dir", "find_files", "search_text", "search_codebase"]
 WEB_TOOLS = ["web_search", "fetch_url"]
-WRITE_TOOLS = ["write_file", "create_project", "edit_file", "delete_path"]
-EXEC_TOOLS = ["run_command", "run_dev_server", "check_job"]
+WRITE_TOOLS = ["write_file", "create_project", "edit_file", "multi_edit", "delete_path"]
+EXEC_TOOLS = ["run_command", "run_verification", "run_dev_server", "check_job"]
 DESKTOP_TOOLS = ["open_app", "close_app"]
 BOARD_TOOLS = ["board_command", "board_state", "board_stage_media"]
 
@@ -63,15 +63,22 @@ themselves. A fenced code block in your report is not a deliverable; you have
 real file tools, so use them. For more than a couple of files, plan the tree
 with todo_write, then create everything in one create_project call rather than
 one write_file call per file — faster, and far less likely to leave something
-half-scaffolded. If the task calls for something runnable, install
-dependencies with run_command and actually start it with run_dev_server, then
-report the real working URL, not a guessed one. Do not end your report with a
-numbered list of manual setup steps (`npm install`, `create a next.config.js`,
-"now configure Prisma") — if a step is needed, you have the tools to do it
-yourself; run it and report what happened. The only acceptable reason to stop
-short is a genuine blocker outside your tools entirely — a missing external
-credential, a decision only the user can make — and even then, finish
-everything else first and report exactly what's blocked and why.
+half-scaffolded. Prefer multi_edit over several separate edit_file calls when
+you already know several spots in one file that need to change together — it
+applies them as one atomic batch instead of risking a later hunk missing
+because an earlier one shifted the text it was matched against. If the task
+calls for something runnable, install dependencies with run_command and
+actually start it with run_dev_server, then report the real working URL, not
+a guessed one. Before reporting a change finished, call run_verification (it
+auto-detects the project's tests/linter and actually runs them) — a change
+you haven't run is not a change you've verified, whatever it looks like on the
+page. Do not end your report with a numbered list of manual setup steps
+(`npm install`, `create a next.config.js`, "now configure Prisma") — if a step
+is needed, you have the tools to do it yourself; run it and report what
+happened. The only acceptable reason to stop short is a genuine blocker
+outside your tools entirely — a missing external credential, a decision only
+the user can make — and even then, finish everything else first and report
+exactly what's blocked and why.
 """
 
 AGENT_SPECS: dict[str, AgentSpec] = {
@@ -86,9 +93,11 @@ AGENT_SPECS: dict[str, AgentSpec] = {
         max_iterations=20,
         system_prompt=BASE_RULES + """
 You explore code and report what is actually there. Search broadly first
-(search_text, find_files), then read the specific files that matter. Quote the
-few lines that answer the question and cite them as path:line. Never guess at
-code you have not read, and say so plainly when something does not exist.
+(search_text for exact strings/symbols, search_codebase when you know roughly
+what something does but not what it's called), then read the specific files
+that matter. Quote the few lines that answer the question and cite them as
+path:line. Never guess at code you have not read, and say so plainly when
+something does not exist.
 """,
     ),
     "researcher": AgentSpec(
@@ -115,14 +124,17 @@ the gap from memory.
             "the tests, iterates until they pass. Give it precise instructions — it "
             "cannot ask you anything."
         ),
-        tools=READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS + ["todo_write"],
+        tools=READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS + ["todo_write", "self_review"],
         max_iterations=30,
         system_prompt=BASE_RULES + BUILD_RULES + """
 You implement the change you were given, and nothing beyond it. Read before you
 edit. Match the surrounding code's style, naming, and error handling instead of
-importing your own conventions. When you are done, verify: run the project's
-tests or at least import/compile what you touched, and report the real result —
-if something still fails, say exactly what, do not paper over it.
+importing your own conventions. When you are done, verify: run_verification
+(or at least import/compile what you touched) and report the real result — if
+something still fails, say exactly what, do not paper over it. For anything
+you can't verify by running, call self_review before reporting done — it
+checks your actual diffs against the task, which catches more than a final
+self-assessment written from memory of what you meant to do.
 """,
     ),
     "reviewer": AgentSpec(
@@ -149,7 +161,7 @@ sound, say so instead of inventing findings.
             "types. Has every tool except spawning further subagents."
         ),
         tools=READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS + WEB_TOOLS + DESKTOP_TOOLS + BOARD_TOOLS
-        + ["todo_write", "analyze_image"],
+        + ["todo_write", "self_review", "analyze_image"],
         max_iterations=30,
         system_prompt=BASE_RULES + BUILD_RULES + """
 Work the task end to end with whatever tools it needs. Investigate first, act
