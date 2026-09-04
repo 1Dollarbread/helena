@@ -54,6 +54,12 @@ class Config:
     max_tool_output_chars: int = 24_000
     history_messages: int = 60          # trimmed before each request
     subagent_max_depth: int = 2
+    # After a turn where files were changed but nothing verified them (no
+    # run_verification call), force one extra iteration nudging the model to
+    # verify before the turn actually ends. See Agent.send in agent.py. This
+    # is the concrete enforcement behind "after changing code, verify it" —
+    # a small local model won't always act on that instruction unprompted.
+    auto_verify: bool = True
 
     # Permissions
     mode: str = "ask"
@@ -190,6 +196,7 @@ class Config:
             ("HELENA_ALLOW_OUTSIDE_WORKSPACE", "allow_outside_workspace"),
             ("HELENA_SPEAK_REPLIES", "speak_replies"),
             ("HELENA_MEMORY_ENABLED", "memory_enabled"),
+            ("HELENA_AUTO_VERIFY", "auto_verify"),
         ):
             val = os.environ.get(env_key)
             if val is not None:
